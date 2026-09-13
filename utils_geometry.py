@@ -89,3 +89,65 @@ def point_distance(point1, point2):
 
     sum_of_squares = sum((x - y) ** 2 for x, y in zip(point1, point2))
     return sum_of_squares ** 0.5
+
+
+def get_relative_direction(origin, target):
+    """
+    Determine the dominant direction from origin to target on Earth.
+
+    Args:
+        origin: [lat, lon, alt] - origin location in degrees and meters
+        target: [lat, lon, alt] - target location in degrees and meters
+
+    Returns:
+        str: Direction description indicating the dominant component
+    """
+    # Earth's mean radius in meters
+    EARTH_RADIUS = 6371000
+
+    lat1, lon1, alt1 = origin
+    lat2, lon2, alt2 = target
+
+    # Convert to radians
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+
+    # Calculate altitude difference
+    alt_diff = alt2 - alt1
+    abs_alt = abs(alt_diff)
+
+    # Calculate haversine distance (horizontal great-circle distance)
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    horizontal_distance = EARTH_RADIUS * c
+
+    # Determine dominant component
+    if horizontal_distance == 0 and abs_alt == 0:
+        return "TARGET IS AT YOUR LOCATION"
+
+    if abs_alt >= horizontal_distance:
+        return "THE TARGET IS " + ("ABOVE" if alt_diff > 0 else "BELOW") + " YOU."
+
+    # Calculate bearing to determine N/S/E/W
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(lat2_rad)
+    x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon)
+    bearing = math.degrees(math.atan2(y, x))
+    bearing = (bearing + 360) % 360
+
+    # Convert bearing to cardinal direction
+    if bearing < 45 or bearing >= 315:
+        direction = "NORTH OF"
+    elif bearing < 135:
+        direction = "EAST OF"
+    elif bearing < 225:
+        direction = "SOUTH OF"
+    else:
+        direction = "WEST OF"
+
+    return "THE TARGET IS " + direction + " YOU."
