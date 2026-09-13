@@ -1,6 +1,7 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from environment import Environment
 import json
+import utils_geometry as geo
 
 # Handles LLM calls & message history
 class Agent:
@@ -105,12 +106,10 @@ class AgentHandler:
     def generate_update_message(self, agent_index: int):
         update_message = ""
         agent = self.agents[agent_index]
-        lat, lon, alt = agent.location
-        target_lat, target_lon, target_alt = self.environment.target_location
 
         match self.scenario:
             case 0:
-                update_message = f"YOUR LOCATION:\n  LATITUDE: {lat:.5f}\n  LONGITUDE: {lon:.5f}\n  ALTITUDE: {alt:.1f}\nTARGET LOCATION:\n  LATITUDE: {target_lat}\n  LONGITUDE: {target_lon}\n  ALTITUDE: {target_alt}"
+                update_message = geo.get_relative_direction(agent.location, self.environment.target_location)
 
         print(update_message)
         return update_message
