@@ -1,95 +1,121 @@
 import warnings
 warnings.filterwarnings('ignore')
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+import matplotlib.pyplot as plt
+import contextily as ctx
+import pymap3d as pm
+from matplotlib.ticker import ScalarFormatter
+import utils_geometry as geo
+import random
+import time
+from agent import Agent, AgentHandler
 
-LLM_model = AutoModelForCausalLM.from_pretrained(
-        "microsoft/Phi-4-mini-instruct",
-        device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=False,
-        )
+from environment import Environment
 
-LLM_tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-4-mini-instruct", clean_up_tokenization_spaces=False)
-pipe = pipeline("text-generation", model=LLM_model, tokenizer=LLM_tokenizer)
-generation_args = {"max_new_tokens": 512, "return_full_text": False, "do_sample": False}
+class Simulation:
 
-system_prompt = """
-You must parse the given natural language input for the mission at hand. All inputs after the first will be updates on how the mission is going.
-Your outputs must follow a specified JSON format.
+    def __init__(self, scenario: int, center_lat: float, center_lon: float, area_size_m: float = 1000):
+        self.scenario = scenario
+        self.center_lat = center_lat
+        self.center_lon = center_lon
+        self.area_size_m = area_size_m
 
-{
-    "movement_target": [int, int, int],
-    "found_target": bool,
-}
+        # Program keeps running when window is closed, use this to stop it
+        self.window_closed = False
 
-1.
-"""
+        self.fig = None
+        self.ax = None
 
-# TODO: Make new structure an array of the structure below. Each entry is its own bot.
+        self.environment = None
+        self.handler = None
 
-messages = [{"role": "system", "content": system_prompt}]
+        self.drone_point = None
+        self.target_point = None
 
-def generate_response(message):
-    messages.append({"role": "user", "content": message})
-    response = pipe(messages, **generation_args)[0]['generated_text']
-    messages.append({"role": "assistant", "content": f"{response.strip()}\n\n"})
-    return response
+
+    # TODO: Expand as the scenarios get more complicated
+    def init_scenario(self):
+        self.environment = Environment(self.scenario, self.center_lat, self.center_lon, self.area_size_m)
+
+    # TODO: Expand as the scenarios get more complicated
+    def init_handler(self):
+        self.handler = AgentHandler(1, 0, self.environment)
+
+
+    # TODO: Expand as the scenarios get more complicated
+    def check_success(self):
+        match self.scenario:
+            case 0:
+                target_lat, target_lon, target_alt = self.environment.target_location
+                drone_lat, drone_lon, drone_alt = self.handler.get_agent_locations()[0]
+                if (geo.degrees_to_meters(target_lat, target_lon, target_alt, drone_lat, drone_lon, drone_alt) < 50):
+                    print("SUCCESS!")
+                    return True
+                print("STILL NOT SUCCESSFUL!")
+                return False
+
+
+    def show_map(self):
+        # Define bounds of the map
+        half_size = self.area_size_m/2
+        min_lat = geo.meters_to_degrees(self.center_lat, self.center_lon, 0, 180, half_size)[0]
+        max_lat = geo.meters_to_degrees(self.center_lat, self.center_lon, 0, 0, half_size)[0]
+        min_lon = geo.meters_to_degrees(self.center_lat, self.center_lon, 0, 270, half_size)[1]
+        max_lon = geo.meters_to_degrees(self.center_lat, self.center_lon, 0, 90, half_size)[1]
+
+        # Create the plot
+        self.fig, self.ax = plt.subplots(figsize=(8, 8))
+        self.ax.set_xlim(min_lon, max_lon)
+        self.ax.set_ylim(min_lat, max_lat)
+        # Format axes
+        self.ax.yaxis.set_major_formatter(lambda x, pos: f"{x:.4f}")
+        self.ax.xaxis.set_major_formatter(lambda x, pos: f"{x:.4f}")
+        # Set title
+        self.ax.set_title(f"Simulation area: {self.center_lat:.5f}, {self.center_lon:.5f}")
+
+        # Display satellite image of the location at the given coords
+        ctx.add_basemap(self.ax, crs="EPSG:4326", source=ctx.providers.Esri.WorldImagery)
+
+        # Display buildings loaded from OSM
+        self.environment.buildings_gdf.plot(ax=self.ax, facecolor="orange", edgecolor="black", alpha=0.5, zorder=3)
+
+        self.update_object_positions()
+
+        # When the window closes, run _on_close
+        self.fig.canvas.mpl_connect('close_event', self._on_close)
+
+        plt.ion()
+        plt.show()
+        plt.pause(0.1)
+
+
+    # Update positions of all objects represented as points (Drones, target, etc.)
+    def update_object_positions(self):
+        if self.drone_point is not None:
+            self.drone_point.remove()
+        if self.target_point is not None:
+            self.target_point.remove()
+
+        drone_lat, drone_lon, drone_alt = self.handler.get_agent_locations()[0]
+        self.drone_point = self.ax.scatter(drone_lon, drone_lat, color="c", zorder=6, s=100)
+
+        target_lat, target_lon, target_alt = self.environment.target_location
+        self.target_point = self.ax.scatter(target_lon, target_lat, color="r", zorder=5, s=100)
+
+        plt.pause(0.01)
+
+
+    def _on_close(self, event):
+        self.window_closed = True
+
+
 
 if __name__ == "__main__":
-    print("Type 'quit', 'q', or 'exit' to exit.")
-    while True:
-        user_input = input("\033[34mYou: ").strip()
-        print("\033[0m")
+    sim = Simulation(scenario=0, center_lat=40.4237, center_lon=-86.9212, area_size_m=1000)  # Purdue University
+    sim.init_scenario()
+    sim.init_handler()
+    sim.show_map()
 
-        if user_input.lower() in ["quit", "q", "exit"]:
-            break
-
-        response = generate_response(user_input)
-        print(f"\033[32mAI: {response}\033[0m")
-
-
-
-# Saved functions from NeLV
-"""
-class Chatbot(QMainWindow):
-
-    def generate_response(self, message, LLM_model, LLM_tokenizer):
-        if self.mode in ["Short Range", "Medium Range", "Long Range"]:
-            self.messages.append({"role": "user", "content": f"{message}\nOnly output the JSON object. No prefix, additional text, or explanation.\n\n"})
-        else:
-            self.messages.append({"role": "user", "content": message})
-        pipe = pipeline("text-generation", model=LLM_model, tokenizer=LLM_tokenizer,)
-        generation_args = {"max_new_tokens": 512, "return_full_text": False, "temperature": 0.0, "do_sample": False, }
-        response = pipe(self.messages, **generation_args)[0]['generated_text']
-        cleaned = response.strip().rstrip('\n')
-        self.messages.append({"role": "assistant", "content": f"{cleaned}\n\n"})
-        return response
-
-    def parse_response(self, response):
-        try:
-            self.planned_flight = json.loads(response)
-        except:
-            try:
-                if "{" in response and "}" in response:
-                    last_open = response.rindex("{")
-                    last_close = response.rindex("}")
-                    response = response[last_open:last_close+1]
-                try:
-                    self.planned_flight = json.loads(response)
-                except:
-                    print("=" * 50)
-                    print("Wrong JSON format!")
-                    print(response)
-                    print("=" * 50)
-                    self.planned_flight = self.route_planner.default_flight
-            except:
-                print("=" * 50)
-                print("Wrong JSON format!")
-                print(response)
-                print("=" * 50)
-                self.planned_flight = self.route_planner.default_flight
-
-"""
-
-
+    while not sim.check_success() and not sim.window_closed:
+        sim.handler.update_agents()
+        sim.update_object_positions()
