@@ -9,10 +9,15 @@ import utils_geometry as geo
 import random
 import time
 from agent import Agent, AgentHandler
+import threading
+import queue
+
 
 from environment import Environment
 
 class Simulation:
+
+
 
     def __init__(self, scenario: int, center_lat: float, center_lon: float, area_size_m: float = 1000):
         self.scenario = scenario
@@ -39,19 +44,29 @@ class Simulation:
 
     # TODO: Expand as the scenarios get more complicated
     def init_handler(self):
-        self.handler = AgentHandler(1, 0, self.environment)
+        num_agents: int
+        match self.scenario:
+            case 0: num_agents = 1
+            case 1: num_agents = 5
+        self.handler = AgentHandler(num_agents, self.scenario, self.environment)
 
 
     # TODO: Expand as the scenarios get more complicated
     def check_success(self):
         match self.scenario:
             case 0:
-                target_lat, target_lon, target_alt = self.environment.target_location
+                target_lat, target_lon, target_alt = self.environment.target_locations[0].get_location()
                 drone_lat, drone_lon, drone_alt = self.handler.get_agent_locations()[0]
                 if (geo.degrees_to_meters(target_lat, target_lon, target_alt, drone_lat, drone_lon, drone_alt) < 50):
                     print("SUCCESS!")
                     return True
                 print("STILL NOT SUCCESSFUL!")
+                return False
+            case 1:
+                if self.environment.all_targets_visited():
+                    print(f"SUCCESS! Completed in {self.handler.num_rounds} rounds.\n")
+                    return True
+                print(f"STILL NOT SUCCESSFUL! (round {self.handler.num_rounds})\n")
                 return False
 
 
@@ -91,16 +106,25 @@ class Simulation:
 
     # Update positions of all objects represented as points (Drones, target, etc.)
     def update_object_positions(self):
-        if self.drone_point is not None:
-            self.drone_point.remove()
-        if self.target_point is not None:
-            self.target_point.remove()
+        # TODO: Replace with calls to environement and agenthandler
+        for location in self.environment.target_locations:
+            if location.scatter_pointer is not None:
+                location.scatter_pointer.remove()
+        for agent in self.handler.agents:
+            if agent.scatter_pointer is not None:
+                agent.scatter_pointer.remove()
 
-        drone_lat, drone_lon, drone_alt = self.handler.get_agent_locations()[0]
-        self.drone_point = self.ax.scatter(drone_lon, drone_lat, color="c", zorder=6, s=100)
 
-        target_lat, target_lon, target_alt = self.environment.target_location
-        self.target_point = self.ax.scatter(target_lon, target_lat, color="r", zorder=5, s=100)
+        for agent in self.handler.agents:
+            lat, lon, _ = geo.local_to_latlon(agent.location[0], agent.location[1], agent.location[2], self.center_lat, self.center_lon)
+            agent.scatter_pointer = self.ax.scatter(lon, lat, color="c", zorder=6, s=100)
+
+
+        for target in self.environment.target_locations:
+            color = "gray" if target.visited else "r"
+            lat, lon, _ = geo.local_to_latlon(target.north_m, target.east_m, target.alt, self.center_lat, self.center_lon)
+            target.scatter_pointer = self.ax.scatter(lon, lat, color=color, zorder=5, s=100)
+
 
         plt.pause(0.01)
 
@@ -110,12 +134,41 @@ class Simulation:
 
 
 
+response_queue = queue.Queue()
+
+
+def agent_worker():
+    while not sim.window_closed:
+        if sim.check_success():
+            break
+        sim.handler.update_agents()  # only the network-bound work happens here
+        response_queue.put("updated")
+
+
 if __name__ == "__main__":
-    sim = Simulation(scenario=0, center_lat=40.4237, center_lon=-86.9212, area_size_m=1000)  # Purdue University
+    # Metrics we'll use to measure the quality of success
+    num_rounds: int
+    num_visits: int
+
+
+    sim = Simulation(scenario=1, center_lat=44.6883889, center_lon=-111.1176389, area_size_m=2500)
     sim.init_scenario()
     sim.init_handler()
     sim.show_map()
 
-    while not sim.check_success() and not sim.window_closed:
-        sim.handler.update_agents()
-        sim.update_object_positions()
+    worker = threading.Thread(target=agent_worker, daemon=True)
+    worker.start()
+
+    # Simulation loop: simulates in rounds, where the drones can move a certain distance each round.
+    # Check if success condition has been met (break if true)
+    # If a drone is not in the middle of a task, ask the associated agent for the next task.
+    # Redraw the map
+    while not sim.window_closed:
+        try:
+            response_queue.get(timeout=0.1)
+            sim.update_object_positions()
+        except queue.Empty:
+            pass
+        plt.pause(0.05)
+
+    print(f"Total rounds: {sim.handler.num_rounds}")
