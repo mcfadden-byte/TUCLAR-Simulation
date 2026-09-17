@@ -151,3 +151,28 @@ def get_relative_direction(origin, target):
         direction = "WEST OF"
 
     return "THE TARGET IS " + direction + " YOU."
+
+
+def latlon_to_local(lat: float, lon: float, alt: float, center_lat: float, center_lon: float) -> tuple:
+    """Convert an absolute (lat, lon, alt) to (north_m, east_m, alt) relative to a center point."""
+    north_m = degrees_to_meters(center_lat, center_lon, 0, lat, center_lon, 0)
+    if lat < center_lat:
+        north_m = -north_m
+
+    east_m = degrees_to_meters(center_lat, center_lon, 0, center_lat, lon, 0)
+    if lon < center_lon:
+        east_m = -east_m
+
+    return (north_m, east_m, alt)
+
+
+def local_to_latlon(north_m: float, east_m: float, alt: float, center_lat: float, center_lon: float) -> tuple:
+    """Convert (north_m, east_m, alt) relative to a center point back to absolute (lat, lon, alt)."""
+    bearing = math.degrees(math.atan2(east_m, north_m)) % 360
+    distance = math.sqrt(north_m**2 + east_m**2)
+    lat, lon, _ = meters_to_degrees(center_lat, center_lon, 0, bearing, distance)
+    return (lat, lon, alt)
+
+def geometric_mean_3d(x1: float, y1: float, z1: float, x2: float, y2: float, z2: float):
+    return ((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)**0.5
+
