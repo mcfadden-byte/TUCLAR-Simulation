@@ -1,4 +1,3 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from environment import Environment
 import json
 import utils_geometry as geo
@@ -100,11 +99,12 @@ class AgentHandler:
                     4. Complete the mission as quick as possible. There is no benefit to visiting the same location multiple times.
                     5. Pick ONE location to visit at a time. Your output must follow the JSON format:
                         {
+                            "thought": string,
                             "move_to_target": int
                         }
 
-                    Example VALID response: {"move_to_target": 4}
-                    Example INVALID response: {"move_to_target": {"index": 7}}
+                    Example VALID response: {"thought": "Teammate 3 is already travelling to target 0, so I'll pick another nearby target.", "move_to_target": 4}
+                    Example INVALID response: {"thought": {"reason": "target 4 is taken.", "decision": "move to target 7"}, "move_to_target": {"index": 7}}
             """
         }
 
