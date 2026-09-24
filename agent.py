@@ -35,7 +35,8 @@ class Agent:
             extra_body={"chat_template_kwargs": {"thinking": False}},
         )
         content = response.choices[0].message.content
-        self.history.append({"role": "assistant", "content": f"{content.strip()}\n\n"})
+        if content:
+            self.history.append({"role": "assistant", "content": f"{content.strip()}\n\n"})
         return content
 
     # Advance position according to velocity
@@ -225,6 +226,9 @@ Reply with a single JSON object and nothing else:
 
     # Interpret the response, search for which target the agent wants to head toward
     def parse_response(self, response: str, agent_index: int):
+        if response is None:
+            print("WARNING: Response is None!")
+            return
         print(response)
         print()
 

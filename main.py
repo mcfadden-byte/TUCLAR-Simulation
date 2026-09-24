@@ -64,23 +64,29 @@ class Simulation:
                 print("STILL NOT SUCCESSFUL!")
                 return False
             case 1:
-                all_visited = self.environment.all_targets_visited()
-                all_home = all(
-                    geo.point_distance(agent.location, [0, 0, 0]) < 1
-                    for agent in self.handler.agents
-                )
-                if all_visited and all_home:
+                if self.check_all_agents_home() and self.check_all_targets_visited():
                     print(f"SUCCESS! Completed in {self.handler.num_rounds} rounds.\n")
                     return True
                 print(f"STILL NOT SUCCESSFUL! (round {self.handler.num_rounds})\n")
                 return False
 
+    def check_all_agents_home(self):
+        return all(
+                    geo.point_distance(agent.location, [0, 0, 0]) < 1
+                    for agent in self.handler.agents
+                )
+
+    def check_all_targets_visited(self):
+        return self.environment.all_targets_visited()
 
     # If all agents decided to go home and do nothing before the mission was complete, the mission is a failure.
     def check_failure(self):
-        if self.handler.check_stalled() and not self.check_success():
-            print(f"MISSION FAILED: all agents inactive, mission incomplete. (round {self.handler.num_rounds})\n")
-            return True
+        match self.scenario:
+            case 1:
+                if self.handler.check_stalled() and not self.check_all_targets_visited():
+                    print(f"MISSION FAILED: all agents inactive, mission incomplete. (round {self.handler.num_rounds})\n")
+                    return True
+                return False
         return False
 
     def show_map(self):
