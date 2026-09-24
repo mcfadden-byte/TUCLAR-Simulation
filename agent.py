@@ -6,6 +6,7 @@ import os
 import csv
 
 log_path = "log.csv"
+summary_log_path = "summary_log.csv"
 VELOCITY_METERS_SECOND = 100
 
 
@@ -20,7 +21,10 @@ class Agent:
         self.velocity = [0,0,0] # North velocity (m/s), East velocity (m/s), Upward velocity (m/s)
         self.scatter_pointer = None # A pointer to this agent's associated drone on the map. Assigned in main.
         self.target_index = -1
+        self.last_target = -1
         self.agent_index = agent_index
+        self.inaction = False
+        self.distance_traveled = 0.0
 
 
     def generate_response(self, message):
@@ -36,6 +40,8 @@ class Agent:
 
     # Advance position according to velocity
     def step(self):
+        step_distance = geo.point_distance([0, 0, 0], self.velocity)  # magnitude of velocity this round
+        self.distance_traveled += step_distance
         self.location[0] += self.velocity[0]
         self.location[1] += self.velocity[1]
         self.location[2] += self.velocity[2]
@@ -45,6 +51,13 @@ class Agent:
         if self.target_index is None:
             return None
         target = environment.target_locations[self.target_index]
+        return geo.point_distance(self.location, target.get_location())
+
+    # Scalar distance between an Agent and its previous target.
+    def distance_to_last_target(self, environment):
+        if self.last_target is None:
+            return None
+        target = environment.target_locations[self.last_target]
         return geo.point_distance(self.location, target.get_location())
 
 
@@ -76,10 +89,37 @@ class AgentHandler:
         self.num_rounds = 0
 
 
+#        self.system_prompt = """
+#            Your output must be in valid JSON format. Do not output anything else.
+#            Your JSON must have "thought" and "action" components.
+
+#            Example VALID output: {"thought": "Teammate 3 is already going to target 4, so I will go to target 2", "action": "FLY 2"}
+#            Example INVALID output: {"thought": {"reason": "Target 4 is busy", "goal": "Visit all targets"}, "action": {"FLY": 2}}
+#        """
 
         self.system_prompt = """
-        You must parse the given natural language input for the mission at hand. All inputs will be updates on how the mission is going.
-        Your outputs must follow the specified JSON format. Do not write anything EXCEPT this JSON structure in your answer.
+## Coordinating from the shared observation
+Decide from the observation you and the other agents all see: reading the same scene and reasoning alike, a rule anchored to that scene leads you all to the same division of labor.
+
+**Role.** Read the ownership: is it overlapping -- do you and the other agents all work the same targets and resources -- or is it divided, each of you already holding its own part?
+  - **Overlapping** (acting alike you would contend for one target or all defer): coordinate -- settle a division of labor over the shared targets from the scene.
+  - **Divided** (your role owns some stages/stations and the other agents own the rest): hold your part and execute. Take the single most useful action within your own part; do not step onto a station or task that belongs to another agent's part, even if it looks like the most useful step right now -- reading the same scene, they are already taking it, so you would only collide. If your own part has no ready step (it waits on their output), do its enabling step or start the next independent unit; wait only when nothing of yours is productive.
+
+**Task.** Settle the division over the shared targets: read how each pending target couples you and apply its rule over the canonical order:
+  1. **Joint** (succeeds only if you all act on it together): converge -- all take the same one: the first such target in that order. (Acting alone wastes it.)
+  2. **Exclusive** (single-occupancy -- multiple acting on it wastes it): divide by item -- take your share by role over that order; the other agents take the complement, so you never collide.
+  3. **Sequential** (ordered hand-off chain): divide by stage -- work the stage your role owns, by the chain order.
+
+## Reply format
+Reply with a single JSON object and nothing else:
+
+{
+  "state":   "<from the observation only: what you hold + which steps are doable now (inputs present); world state, never the other agents' intent>",
+  "role":    "<is ownership overlapping (you and the other agents all work the same targets/resources -> coordinate) or divided (your role owns some stages/stations, the others own the rest -> execute your own), and why>",
+  "task":    "<for each pending shared target, how it couples you -- Joint / Exclusive / Sequential>",
+  "plan":    "<overlapping: apply the matching rule per target over the canonical order -- Joint: converge on the first such target; Exclusive: your role's share; Sequential: your stage; divided: the most useful step within your own part (enabling step or next unit if none ready), not a step that belongs to another agent's part>",
+  "action":  "<copy one action verbatim from your currently-legal actions>"
+}\n
 
         """
 
@@ -94,17 +134,14 @@ class AgentHandler:
             1: """
                 MISSION REQUIREMENTS:
                     1. There is a series of locations that you will be given.
-                    2. You will have a series of teammates. You know where they are, but you cannot communicate with them.
-                    3. The mission is a success once all given locations have been visited at least once by you or a teammate.
+                    2. You will have a series of teammates. You know where they are going, but you cannot communicate with them.
+                    3. The mission is a success once all given locations have been visited at least once by you or a teammate, AND all drones have gone back to their start location.
                     4. Complete the mission as quick as possible. There is no benefit to visiting the same location multiple times.
-                    5. Pick ONE location to visit at a time. Your output must follow the JSON format:
-                        {
-                            "thought": string,
-                            "move_to_target": int
-                        }
-
-                    Example VALID response: {"thought": "Teammate 3 is already travelling to target 0, so I'll pick another nearby target.", "move_to_target": 4}
-                    Example INVALID response: {"thought": {"reason": "target 4 is taken.", "decision": "move to target 7"}, "move_to_target": {"index": 7}}
+                    5. Pick ONE location to visit at a time. You have 3 available actions:
+                            "IDLE": Do nothing.
+                            "FLY 0", "FLY 1", "FLY 2"...: Travel to the target with the given index.
+                            "RECALL": Go back to your starting location.
+                    6. It takes multiple rounds for you to travel to a location. You may need to use the FLY action multiple times on the same target before you arrive.
             """
         }
 
@@ -116,8 +153,34 @@ class AgentHandler:
             self.agents.append(Agent(system_prompt=self.system_prompt, client=self.client, model=self.model, start_location=[0, 0, 1000], agent_index=idx)) #TODO: Have system that detects ground level?
 
         self.log_path = log_path
+        self.summary_log_path = summary_log_path
         self.init_log()
 
+
+    def get_total_distance_traveled(self):
+        return sum(agent.distance_traveled for agent in self.agents)
+
+    def get_revisit_rate(self):
+        targets = self.environment.target_locations
+        if not targets:
+            return 0.0
+        revisited = sum(1 for t in targets if len(t.visitors) > 1)
+        return revisited / len(targets)
+
+    def log_summary(self, success: bool):
+        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds"]
+        row = [
+            f"{self.get_total_distance_traveled():.2f}",
+            f"{self.get_revisit_rate():.4f}",
+            success,
+            self.num_rounds,
+        ]
+        file_exists = os.path.exists(self.summary_log_path)
+        with open(self.summary_log_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerow(row)
 
     def init_log(self):
         header = [f"agent{i}" for i in range(self.num_agents)] + \
@@ -145,7 +208,12 @@ class AgentHandler:
     # Update all agents on the situation, ask for a new course of action (or continue the current one)
     def update_agents(self):
         for idx in range(0, self.num_agents):
-            self.parse_response(self.agents[idx].generate_response(self.generate_update_message(idx)), idx)
+            if not self.agents[idx].inaction:
+                self.parse_response(self.agents[idx].generate_response(self.generate_update_message(idx)), idx)
+
+        for idx in range(0, self.num_agents):
+            if not self.agents[idx].inaction:
+                self.agents[idx].last_target = self.agents[idx].target_index
 
         for agent in self.agents:
             self.update_velocity(agent)
@@ -158,6 +226,8 @@ class AgentHandler:
     # Interpret the response, search for which target the agent wants to head toward
     def parse_response(self, response: str, agent_index: int):
         print(response)
+        print()
+
         agent = self.agents[agent_index]
         try:
             if "{" in response and "}" in response:
@@ -166,9 +236,26 @@ class AgentHandler:
                 response = response[first_open:last_close + 1]
             data = json.loads(response)
 
-            target_index = data.get("move_to_target", agent.target_index)
-            if target_index is not None and 0 <= target_index < len(self.environment.target_locations):
-                agent.target_index = target_index
+            #IDLE: Set velocity to zero.
+            #FLY X: Set velocity similar to previous implementation
+            #RECALL: Set inaction to True, set velocity to go back to start.
+            action = data.get("action", "")
+            if action == "IDLE":
+                agent.target_index = None
+            elif action == "RECALL":
+                agent.target_index = "Home"
+                agent.inaction = True
+            elif action.startswith("FLY "):
+                try:
+                    index = int(action.removeprefix("FLY "))
+                    if 0 <= index < len(self.environment.target_locations):
+                        agent.target_index = index
+                    else:
+                        print(f"Agent {agent_index} gave out-of-range FLY index: {index}")
+                except ValueError:
+                    print(f"Agent {agent_index} gave malformed FLY action: {action!r}")
+            else:
+                print(f"Agent {agent_index} gave unrecognized action: {action!r}")
 
         except json.JSONDecodeError:
             print(f"Invalid JSON response: {response}")
@@ -179,18 +266,31 @@ class AgentHandler:
             agent.velocity = [0, 0, 0]
             return
 
-        target = self.environment.target_locations[agent.target_index]
-        target_location = target.get_location()
-
-        distance = geo.point_distance(agent.location, target_location)
-        if distance < 1e-6:
-            agent.velocity = [0, 0, 0]
+        if agent.target_index == "Home":
+            distance = geo.point_distance(agent.location, [0, 0, 0])
+            if distance < 1:
+                agent.velocity = [0, 0, 0]
+                return
+            speed = min(VELOCITY_METERS_SECOND, distance)
+            scale = speed / distance
+            agent.velocity = [-d * scale for d in agent.location]
             return
 
-        delta = [target_location[i] - agent.location[i] for i in range(3)]
-        speed = min(VELOCITY_METERS_SECOND, distance)
-        scale = speed / distance
-        agent.velocity = [d * scale for d in delta]
+        if not isinstance(agent.target_index, int):
+            print(f"WARNING: Non-integer target index: {agent.target_index}")
+        else:
+            target = self.environment.target_locations[agent.target_index]
+            target_location = target.get_location()
+
+            distance = geo.point_distance(agent.location, target_location)
+            if distance < 1e-6:
+                agent.velocity = [0, 0, 0]
+                return
+
+            delta = [target_location[i] - agent.location[i] for i in range(3)]
+            speed = min(VELOCITY_METERS_SECOND, distance)
+            scale = speed / distance
+            agent.velocity = [d * scale for d in delta]
 
 
 
@@ -205,26 +305,41 @@ class AgentHandler:
             case 0:
                 target_loc = self.environment.target_locations[0].get_location()
                 update_message = (
-                    f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m, Z={agent.location[2]:.1f}m.\n"
-                    f"TARGET LOCATION: X={target_loc[0]:.1f}m, Y={target_loc[1]:.1f}m, Z={target_loc[2]:.1f}m.\n"
+                    f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m.\n"
+                    f"TARGET LOCATION: X={target_loc[0]:.1f}m, Y={target_loc[1]:.1f}m.\n"
                 )
             case 1:
                 update_message += (
-                    f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m, Z={agent.location[2]:.1f}m\n"
-                    f"YOUR VELOCITY: X={agent.velocity[0]:.1f}m/s, Y={agent.velocity[1]:.1f}m/s, up={agent.velocity[2]:.1f}m/s\n"
+                    f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
+                    #f"YOUR VELOCITY: X={agent.velocity[0]:.1f}m/s, Y={agent.velocity[1]:.1f}m/s\n"
                 )
 
                 for idx in range(0, len(self.agents)):
-                    if idx == agent_index:
+                    if idx == agent_index or self.agents[idx].inaction:
                         continue
                     teammate = self.agents[idx]
+                    teammate_target: str
+                    if teammate.last_target == -1:
+                        teammate_target = "Unknown"
+                    else:
+                        teammate_target = f"{teammate.last_target}"#, and is {teammate.distance_to_last_target(self.environment):.0f} meters away."
                     update_message += (
-                        f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate.target_index}, and is {teammate.distance_to_target(self.environment):.0f} meters away.\n"
+                        f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
                     )
-
+                all_targets_visited: True
                 for idx, target in enumerate(self.environment.target_locations):
-                    status = "VISITED" if target.visited else "NOT VISITED"
-                    update_message += f"TARGET {idx}: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, Z={target.alt:.1f}m, Total Distance: {geo.geometric_mean_3d(agent.location[0], agent.location[1], agent.location[2], target.north_m, target.east_m, target.alt):.0f} meters away. ({status})\n"
+                    if target.visited == False:
+                        all_targets_visited = False
+                        break
+                if not all_targets_visited:
+                    update_message += "\nThe following targets have yet to be visited:\n"
+                    for idx, target in enumerate(self.environment.target_locations):
+                        if target.visited:
+                            continue
+                        #status = "VISITED" if target.visited else "NOT VISITED"
+                        update_message += f"TARGET {idx}: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, Total Distance: {geo.geometric_mean_3d(agent.location[0], agent.location[1], agent.location[2], target.north_m, target.east_m, target.alt):.0f} meters away.\n"
+                else:
+                    update_message += "\nAll targets have been visited.\n"
 
         print(update_message)
         print("End AI prompt\n")
@@ -237,3 +352,7 @@ class AgentHandler:
         for agent in self.agents:
             locations.append(agent.location)
         return locations
+
+    # Check if the agents all decided to go home and do nothing
+    def check_stalled(self):
+        return all(agent.inaction for agent in self.agents)

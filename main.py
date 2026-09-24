@@ -1,6 +1,7 @@
 import warnings
 warnings.filterwarnings('ignore')
 
+
 import matplotlib.pyplot as plt
 import contextily as ctx
 import pymap3d as pm
@@ -63,12 +64,24 @@ class Simulation:
                 print("STILL NOT SUCCESSFUL!")
                 return False
             case 1:
-                if self.environment.all_targets_visited():
+                all_visited = self.environment.all_targets_visited()
+                all_home = all(
+                    geo.point_distance(agent.location, [0, 0, 0]) < 1
+                    for agent in self.handler.agents
+                )
+                if all_visited and all_home:
                     print(f"SUCCESS! Completed in {self.handler.num_rounds} rounds.\n")
                     return True
                 print(f"STILL NOT SUCCESSFUL! (round {self.handler.num_rounds})\n")
                 return False
 
+
+    # If all agents decided to go home and do nothing before the mission was complete, the mission is a failure.
+    def check_failure(self):
+        if self.handler.check_stalled() and not self.check_success():
+            print(f"MISSION FAILED: all agents inactive, mission incomplete. (round {self.handler.num_rounds})\n")
+            return True
+        return False
 
     def show_map(self):
         # Define bounds of the map
@@ -100,13 +113,12 @@ class Simulation:
         self.fig.canvas.mpl_connect('close_event', self._on_close)
 
         plt.ion()
-        plt.show()
+        plt.draw()
         plt.pause(0.1)
 
 
     # Update positions of all objects represented as points (Drones, target, etc.)
     def update_object_positions(self):
-        # TODO: Replace with calls to environement and agenthandler
         for location in self.environment.target_locations:
             if location.scatter_pointer is not None:
                 location.scatter_pointer.remove()
@@ -139,7 +151,7 @@ response_queue = queue.Queue()
 
 def agent_worker():
     while not sim.window_closed:
-        if sim.check_success():
+        if sim.check_success() or sim.check_failure():
             break
         sim.handler.update_agents()  # only the network-bound work happens here
         response_queue.put("updated")
@@ -169,6 +181,9 @@ if __name__ == "__main__":
             sim.update_object_positions()
         except queue.Empty:
             pass
-        plt.pause(0.05)
+        sim.fig.canvas.flush_events()
+        time.sleep(0.05)
 
+    success = sim.check_success()
+    sim.handler.log_summary(success)
     print(f"Total rounds: {sim.handler.num_rounds}")
