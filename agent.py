@@ -326,7 +326,7 @@ Reply with a single JSON object and nothing else:
                     update_message += (
                         f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
                     )
-                all_targets_visited: True
+                all_targets_visited = True
                 for idx, target in enumerate(self.environment.target_locations):
                     if target.visited == False:
                         all_targets_visited = False
