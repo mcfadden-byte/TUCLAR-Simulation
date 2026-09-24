@@ -15,6 +15,7 @@ class TargetLocation:
         self.visited: bool = False
         self.scatter_pointer = None # A pointer to this agent's associated scatter point on the map. Assigned in main.
         self.visited_by: int = -1
+        self.visitors = set()
 
     #def get_location_degrees(self):
     #    return self.lat, self.lon, self.alt
@@ -59,13 +60,14 @@ class Environment:
         return self.buildings_gdf.intersects(point).any()
 
     def check_visits(self, agents):
-        for agent in agents:
-            for location in self.target_locations:
-                [lat1, lon1, alt1] = location.get_location()
-                if geo.geometric_mean_3d(lat1, lon1, alt1, agent.location[0], agent.location[1], agent.location[2]) < VISIT_RADIUS_METERS:
-                    location.visited = True
-                    location.visited_by = agent.agent_index
-                    break
+        for target in self.target_locations:
+            for agent in agents:
+                dist = geo.point_distance(agent.location, target.get_location())
+                if dist < VISIT_RADIUS_METERS:
+                    if agent.agent_index not in target.visitors:
+                        target.visitors.add(agent.agent_index)
+                    target.visited = True
+                    target.visited_by = agent.agent_index
 
 
     def check_visit(self, lat: float, lon: float, alt: float):
