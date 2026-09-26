@@ -12,7 +12,8 @@ import time
 from agent import Agent, AgentHandler
 import threading
 import queue
-
+import find_optimal
+import math
 
 from environment import Environment
 
@@ -150,6 +151,29 @@ class Simulation:
     def _on_close(self, event):
         self.window_closed = True
 
+    def find_optimal(self):
+        drone_locations = self.handler.get_agent_locations()
+        target_locations = self.environment.get_target_locations()
+
+        # The method commented below finds the exact correct solution. It is very slow when there are many drones and targets.
+        #routes = find_optimal.solve_exact(drone_locations, target_locations)
+        #lengths = find_optimal.route_lengths(drone_locations, target_locations, routes)
+        #print("Exact solution:")
+        #for i, r in enumerate(routes):
+        #    print(f"  Drone {i}: targets {r}  (route length {lengths[i]:.3f})")
+        #print(f"  Max route length (objective): {max(lengths):.3f}")
+
+        # This method may not find the perfect solution, but it is very fast
+        routes_h = find_optimal.solve_heuristic(drone_locations, target_locations)
+        lengths_h = find_optimal.route_lengths(drone_locations, target_locations, routes_h)
+        print("\nHeuristic solution:")
+        for i, r in enumerate(routes_h):
+            print(f"  Drone {i}: targets {r}  (route length {lengths_h[i]:.3f})")
+        print(f"  Max route length (objective): {max(lengths_h):.3f}")
+        print(f"Optimal solution finishes in {math.ceil(max(lengths_h)/self.handler.drone_velocity)} rounds\n")
+
+        return max(lengths_h)
+
 
 
 response_queue = queue.Queue()
@@ -168,12 +192,16 @@ if __name__ == "__main__":
     num_rounds: int
     num_visits: int
 
-
+    # Initialize simulation
     sim = Simulation(scenario=1, center_lat=44.6883889, center_lon=-111.1176389, area_size_m=2500)
     sim.init_scenario()
     sim.init_handler()
     sim.show_map()
 
+    # Find the optimal solution, for comparison
+    optimal_rounds = math.ceil(sim.find_optimal() / sim.handler.drone_velocity)
+
+    # Threading agent to help redraw the plot
     worker = threading.Thread(target=agent_worker, daemon=True)
     worker.start()
 
@@ -191,5 +219,5 @@ if __name__ == "__main__":
         time.sleep(0.05)
 
     success = sim.check_success()
-    sim.handler.log_summary(success)
+    sim.handler.log_summary(success, optimal_rounds)
     print(f"Total rounds: {sim.handler.num_rounds}")

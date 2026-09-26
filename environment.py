@@ -43,7 +43,7 @@ class Environment:
                 self.target_locations.append(TargetLocation(random.uniform(-area_size_m, area_size_m), random.uniform(-area_size_m, area_size_m)))
             case 1:
                 #TODO Replace with forest spots?
-                for i in range(0, 7):
+                for i in range(0, 8):
                     self.target_locations.append(TargetLocation(random.uniform(-area_size_m/2, area_size_m/2), random.uniform(-area_size_m/2, area_size_m/2)))
 
     # Load map data. Just loads buildings for now.
@@ -85,4 +85,10 @@ class Environment:
                 result = False
                 break
 
+        return result
+
+    def get_target_locations(self):
+        result = []
+        for target in self.target_locations:
+            result.append(target.get_location())
         return result

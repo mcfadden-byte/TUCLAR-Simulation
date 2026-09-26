@@ -1,3 +1,5 @@
+# Code written entirely by AI.
+
 import math
 
 EARTH_RADIUS_M = 6371000  # Earth's mean radius in meters

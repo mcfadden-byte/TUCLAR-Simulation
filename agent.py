@@ -8,7 +8,7 @@ import random
 
 log_path = "log.csv"
 summary_log_path = "summary_log.csv"
-VELOCITY_METERS_SECOND = 100
+
 
 
 # Handles LLM calls & message history
@@ -92,7 +92,7 @@ class AgentHandler:
         self.environment = environment
         self.num_rounds = 0
         self.comms_quality = 0.5
-
+        self.drone_velocity = 100
 
 #        self.system_prompt = """
 #            Your output must be in valid JSON format. Do not output anything else.
@@ -173,14 +173,15 @@ Reply with a single JSON object and nothing else:
         revisited = sum(1 for t in targets if len(t.visitors) > 1)
         return revisited / len(targets)
 
-    def log_summary(self, success: bool):
-        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality"]
+    def log_summary(self, success: bool, optimal_length):
+        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality", "optimal_solution_length"]
         row = [
             f"{self.get_total_distance_traveled():.2f}",
             f"{self.get_revisit_rate():.4f}",
             success,
             self.num_rounds,
             self.comms_quality,
+            optimal_length
         ]
         file_exists = os.path.exists(self.summary_log_path)
         with open(self.summary_log_path, "a", newline="") as f:
@@ -287,7 +288,7 @@ Reply with a single JSON object and nothing else:
             if distance < 1:
                 agent.velocity = [0, 0, 0]
                 return
-            speed = min(VELOCITY_METERS_SECOND, distance)
+            speed = min(self.drone_velocity, distance)
             scale = speed / distance
             agent.velocity = [-d * scale for d in agent.location]
             return
@@ -304,7 +305,7 @@ Reply with a single JSON object and nothing else:
                 return
 
             delta = [target_location[i] - agent.location[i] for i in range(3)]
-            speed = min(VELOCITY_METERS_SECOND, distance)
+            speed = min(self.drone_velocity, distance)
             scale = speed / distance
             agent.velocity = [d * scale for d in delta]
 
