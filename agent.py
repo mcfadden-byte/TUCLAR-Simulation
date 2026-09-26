@@ -4,6 +4,7 @@ import utils_geometry as geo
 from openai import OpenAI
 import os
 import csv
+import random
 
 log_path = "log.csv"
 summary_log_path = "summary_log.csv"
@@ -25,6 +26,8 @@ class Agent:
         self.agent_index = agent_index
         self.inaction = False
         self.distance_traveled = 0.0
+        self.displayed_message = "Yet to act, no message for now."
+        #self.next_message = ""
 
 
     def generate_response(self, message):
@@ -88,6 +91,7 @@ class AgentHandler:
         self.scenario = scenario
         self.environment = environment
         self.num_rounds = 0
+        self.comms_quality = 0.5
 
 
 #        self.system_prompt = """
@@ -119,6 +123,7 @@ Reply with a single JSON object and nothing else:
   "role":    "<is ownership overlapping (you and the other agents all work the same targets/resources -> coordinate) or divided (your role owns some stages/stations, the others own the rest -> execute your own), and why>",
   "task":    "<for each pending shared target, how it couples you -- Joint / Exclusive / Sequential>",
   "plan":    "<overlapping: apply the matching rule per target over the canonical order -- Joint: converge on the first such target; Exclusive: your role's share; Sequential: your stage; divided: the most useful step within your own part (enabling step or next unit if none ready), not a step that belongs to another agent's part>",
+  "message": "<whatever you enter here may or may not reach your teammates. communication is unreliable in this scenario, but try your best to collaborate>"
   "action":  "<copy one action verbatim from your currently-legal actions>"
 }\n
 
@@ -169,12 +174,13 @@ Reply with a single JSON object and nothing else:
         return revisited / len(targets)
 
     def log_summary(self, success: bool):
-        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds"]
+        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality"]
         row = [
             f"{self.get_total_distance_traveled():.2f}",
             f"{self.get_revisit_rate():.4f}",
             success,
             self.num_rounds,
+            self.comms_quality,
         ]
         file_exists = os.path.exists(self.summary_log_path)
         with open(self.summary_log_path, "a", newline="") as f:
@@ -219,6 +225,7 @@ Reply with a single JSON object and nothing else:
         for agent in self.agents:
             self.update_velocity(agent)
             agent.step()
+            #agent.displayed_message = agent.next_message
 
         self.environment.check_visits(self.agents)
         self.log_round()
@@ -260,6 +267,11 @@ Reply with a single JSON object and nothing else:
                     print(f"Agent {agent_index} gave malformed FLY action: {action!r}")
             else:
                 print(f"Agent {agent_index} gave unrecognized action: {action!r}")
+
+            if random.random() < self.comms_quality:
+                self.agents[agent_index].displayed_message = data.get("message", "")
+            else:
+                self.agents[agent_index].displayed_message = "Communication Failure."
 
         except json.JSONDecodeError:
             print(f"Invalid JSON response: {response}")
@@ -313,9 +325,13 @@ Reply with a single JSON object and nothing else:
                     f"TARGET LOCATION: X={target_loc[0]:.1f}m, Y={target_loc[1]:.1f}m.\n"
                 )
             case 1:
+                mates = ", ".join(str(j) for j in range(self.num_agents) if j != agent_index)
                 update_message += (
+                    f"## Who you are\n"
+                    f"You are **agent {agent_index}**; your teammates are agents {mates}. "
+                    f"All {self.num_agents} of you reason in exactly the same way -- your role label is the only "
+                    f"thing that distinguishes you.\n\n"
                     f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
-                    #f"YOUR VELOCITY: X={agent.velocity[0]:.1f}m/s, Y={agent.velocity[1]:.1f}m/s\n"
                 )
 
                 for idx in range(0, len(self.agents)):
@@ -329,6 +345,7 @@ Reply with a single JSON object and nothing else:
                         teammate_target = f"{teammate.last_target}"#, and is {teammate.distance_to_last_target(self.environment):.0f} meters away."
                     update_message += (
                         f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
+                        f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n\n"
                     )
                 all_targets_visited = True
                 for idx, target in enumerate(self.environment.target_locations):
@@ -343,7 +360,10 @@ Reply with a single JSON object and nothing else:
                         #status = "VISITED" if target.visited else "NOT VISITED"
                         update_message += f"TARGET {idx}: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, Total Distance: {geo.geometric_mean_3d(agent.location[0], agent.location[1], agent.location[2], target.north_m, target.east_m, target.alt):.0f} meters away.\n"
                 else:
-                    update_message += "\nAll targets have been visited.\n"
+                    update_message += (
+                        "\nAll targets have been visited. The mission is not complete until every drone is back at "
+                        "its start location, and IDLE does not move you there. You should now RECALL.\n"
+                    )
 
         print(update_message)
         print("End AI prompt\n")
