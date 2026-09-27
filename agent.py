@@ -5,10 +5,37 @@ from openai import OpenAI
 import os
 import csv
 import random
+import re
 
 log_path = "log.csv"
 summary_log_path = "summary_log.csv"
 
+
+#        self.system_prompt = """
+## Coordinating from the shared observation
+"""Decide from the observation you and the other agents all see: reading the same scene and reasoning alike, a rule anchored to that scene leads you all to the same division of labor.
+
+**Role.** Read the ownership: is it overlapping -- do you and the other agents all work the same targets and resources -- or is it divided, each of you already holding its own part?
+  - **Overlapping** (acting alike you would contend for one target or all defer): coordinate -- settle a division of labor over the shared targets from the scene.
+  - **Divided** (your role owns some stages/stations and the other agents own the rest): hold your part and execute. Take the single most useful action within your own part; do not step onto a station or task that belongs to another agent's part, even if it looks like the most useful step right now -- reading the same scene, they are already taking it, so you would only collide. If your own part has no ready step (it waits on their output), do its enabling step or start the next independent unit; wait only when nothing of yours is productive.
+
+**Task.** Settle the division over the shared targets: read how each pending target couples you and apply its rule over the canonical order:
+  1. **Joint** (succeeds only if you all act on it together): converge -- all take the same one: the first such target in that order. (Acting alone wastes it.)
+  2. **Exclusive** (single-occupancy -- multiple acting on it wastes it): divide by item -- take your share by role over that order; the other agents take the complement, so you never collide.
+  3. **Sequential** (ordered hand-off chain): divide by stage -- work the stage your role owns, by the chain order.
+
+## Reply format
+Reply with a single JSON object and nothing else:
+
+{
+  "state":   "<from the observation only: what you hold + which steps are doable now (inputs present); world state, never the other agents' intent>",
+  "role":    "<is ownership overlapping (you and the other agents all work the same targets/resources -> coordinate) or divided (your role owns some stages/stations, the others own the rest -> execute your own), and why>",
+  "task":    "<for each pending shared target, how it couples you -- Joint / Exclusive / Sequential>",
+  "plan":    "<overlapping: apply the matching rule per target over the canonical order -- Joint: converge on the first such target; Exclusive: your role's share; Sequential: your stage; divided: the most useful step within your own part (enabling step or next unit if none ready), not a step that belongs to another agent's part>",
+  "message": "<whatever you enter here may or may not reach your teammates. communication is unreliable in this scenario, but try your best to collaborate>"
+  "action":  "<copy one action verbatim from your currently-legal actions>"
+}\n
+"""
 
 
 # Handles LLM calls & message history
@@ -94,40 +121,15 @@ class AgentHandler:
         self.comms_quality = 0.5
         self.drone_velocity = 100
 
-#        self.system_prompt = """
-#            Your output must be in valid JSON format. Do not output anything else.
-#            Your JSON must have "thought" and "action" components.
-
-#            Example VALID output: {"thought": "Teammate 3 is already going to target 4, so I will go to target 2", "action": "FLY 2"}
-#            Example INVALID output: {"thought": {"reason": "Target 4 is busy", "goal": "Visit all targets"}, "action": {"FLY": 2}}
-#        """
-
         self.system_prompt = """
-## Coordinating from the shared observation
-Decide from the observation you and the other agents all see: reading the same scene and reasoning alike, a rule anchored to that scene leads you all to the same division of labor.
+            Your output must be in valid JSON format. Do not output anything else.
+            Your JSON must have "thought", "message", and "action" components.
+            You can communicate to your teammates through "message", but they may or may not receive it.
 
-**Role.** Read the ownership: is it overlapping -- do you and the other agents all work the same targets and resources -- or is it divided, each of you already holding its own part?
-  - **Overlapping** (acting alike you would contend for one target or all defer): coordinate -- settle a division of labor over the shared targets from the scene.
-  - **Divided** (your role owns some stages/stations and the other agents own the rest): hold your part and execute. Take the single most useful action within your own part; do not step onto a station or task that belongs to another agent's part, even if it looks like the most useful step right now -- reading the same scene, they are already taking it, so you would only collide. If your own part has no ready step (it waits on their output), do its enabling step or start the next independent unit; wait only when nothing of yours is productive.
+            Example VALID output: {"thought": "Teammate 3 is already going to target 4, so I will go to target 2", "message": "I will go to target 2, nobody else needs to go there." "action": "FLY 2"}
+            Example INVALID output: {"thought": {"reason": "Target 4 is busy", "goal": "Visit all targets"}, "action": {"FLY": 2}}"""
 
-**Task.** Settle the division over the shared targets: read how each pending target couples you and apply its rule over the canonical order:
-  1. **Joint** (succeeds only if you all act on it together): converge -- all take the same one: the first such target in that order. (Acting alone wastes it.)
-  2. **Exclusive** (single-occupancy -- multiple acting on it wastes it): divide by item -- take your share by role over that order; the other agents take the complement, so you never collide.
-  3. **Sequential** (ordered hand-off chain): divide by stage -- work the stage your role owns, by the chain order.
 
-## Reply format
-Reply with a single JSON object and nothing else:
-
-{
-  "state":   "<from the observation only: what you hold + which steps are doable now (inputs present); world state, never the other agents' intent>",
-  "role":    "<is ownership overlapping (you and the other agents all work the same targets/resources -> coordinate) or divided (your role owns some stages/stations, the others own the rest -> execute your own), and why>",
-  "task":    "<for each pending shared target, how it couples you -- Joint / Exclusive / Sequential>",
-  "plan":    "<overlapping: apply the matching rule per target over the canonical order -- Joint: converge on the first such target; Exclusive: your role's share; Sequential: your stage; divided: the most useful step within your own part (enabling step or next unit if none ready), not a step that belongs to another agent's part>",
-  "message": "<whatever you enter here may or may not reach your teammates. communication is unreliable in this scenario, but try your best to collaborate>"
-  "action":  "<copy one action verbatim from your currently-legal actions>"
-}\n
-
-        """
 
         self.scenario_system_prompts = {
 
@@ -237,6 +239,7 @@ Reply with a single JSON object and nothing else:
         if response is None:
             print("WARNING: Response is None!")
             return
+        repair_json_newlines(response)
         print(response)
         print()
 
@@ -381,3 +384,8 @@ Reply with a single JSON object and nothing else:
     # Check if the agents all decided to go home and do nothing
     def check_stalled(self):
         return all(agent.inaction for agent in self.agents)
+
+
+def repair_json_newlines(text):
+    # Remove newline characters from the JSON text
+    return re.sub(r'(?<!\\)\n(?=[^"]*")', r'\\n', text)
