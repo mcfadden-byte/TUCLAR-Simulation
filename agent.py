@@ -1,4 +1,4 @@
-from environment import Environment
+from environment import Environment, TargetType, VISIT_RADIUS_METERS
 import json
 import utils_geometry as geo
 from openai import OpenAI
@@ -6,9 +6,11 @@ import os
 import csv
 import random
 import re
+from enum import Enum
 
 log_path = "log.csv"
 summary_log_path = "summary_log.csv"
+
 
 
 #        self.system_prompt = """
@@ -111,7 +113,7 @@ class AgentHandler:
         )
         #"nvidia/nemotron-3.5-lightning-30b-a3b"
         #mistralai/mistral-nemotron
-        self.model = "nvidia/nemotron-3.5-lightning-30b-a3b"
+        self.model = "nvidia/nemotron-3-ultra-550b-a55b"
 
         self.generation_args = {"max_tokens": 512, "return_full_text": False, "temperature": False}
 
@@ -142,14 +144,15 @@ class AgentHandler:
             1: """
                 MISSION REQUIREMENTS:
                     1. There is a series of locations that you will be given.
-                    2. You will have a series of teammates. You know where they are going, but you cannot communicate with them.
-                    3. The mission is a success once all given locations have been visited at least once by you or a teammate, AND all drones have gone back to their start location.
-                    4. Complete the mission as quick as possible. There is no benefit to visiting the same location multiple times.
-                    5. Pick ONE location to visit at a time. You have 3 available actions:
+                    2. You will have a series of teammates. You know where they are going, but you cannot communicate with them. All your teammates reason exactly the same as you.
+                    3. The mission is a success once all target locations are cleared, and you have used the RECALL action to go back to start.
+                    4. There are three types of target location: Sequential, which must be visited by three different agents at any point (you do not need to all visit at the same time). Joint, which must be visited by two different agents at the *same time*. And Exclusive, which must be visited by any agent.
+                    5. Complete the mission as quick as possible.
+                    6. Pick ONE location to visit at a time. You have 3 available actions:
                             "IDLE": Do nothing.
                             "FLY 0", "FLY 1", "FLY 2"...: Travel to the target with the given index.
                             "RECALL": Go back to your starting location.
-                    6. It takes multiple rounds for you to travel to a location. You may need to use the FLY action multiple times on the same target before you arrive.
+                    6. It takes multiple rounds for you to travel to a location. You may need to use the FLY action multiple times on the same target before you arrive. Do not assume a target has been visited until it has been cleared from the target list.
             """
         }
 
@@ -217,9 +220,12 @@ class AgentHandler:
 
     # Update all agents on the situation, ask for a new course of action (or continue the current one)
     def update_agents(self):
-        for idx in range(0, self.num_agents):
-            if not self.agents[idx].inaction:
-                self.parse_response(self.agents[idx].generate_response(self.generate_update_message(idx)), idx)
+        # Snapshot who needs a decision before any responses change targets
+        to_prompt = [idx for idx in range(self.num_agents) if self.should_prompt(self.agents[idx])]
+        print(f"Round {self.num_rounds}: prompting agents {to_prompt}")
+
+        for idx in to_prompt:
+            self.parse_response(self.agents[idx].generate_response(self.generate_update_message(idx)), idx)
 
         for idx in range(0, self.num_agents):
             if not self.agents[idx].inaction:
@@ -282,7 +288,7 @@ class AgentHandler:
 
     # Set velocity to go towards the target.
     def update_velocity(self, agent):
-        if agent.target_index is None:
+        if agent.target_index is None or agent.target_index == -1:
             agent.velocity = [0, 0, 0]
             return
 
@@ -324,18 +330,15 @@ class AgentHandler:
         match self.scenario:
             case 0:
                 target_loc = self.environment.target_locations[0].get_location()
-                update_message = (
-                    f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m.\n"
-                    f"TARGET LOCATION: X={target_loc[0]:.1f}m, Y={target_loc[1]:.1f}m.\n"
-                )
+                #update_message = (
+                    #f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m.\n"
+                    #f"TARGET LOCATION: X={target_loc[0]:.1f}m, Y={target_loc[1]:.1f}m.\n"
+                #)
             case 1:
                 mates = ", ".join(str(j) for j in range(self.num_agents) if j != agent_index)
                 update_message += (
-                    f"## Who you are\n"
-                    f"You are **agent {agent_index}**; your teammates are agents {mates}. "
-                    f"All {self.num_agents} of you reason in exactly the same way -- your role label is the only "
-                    f"thing that distinguishes you.\n\n"
-                    f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
+                    f"You are **agent {agent_index}**; your teammates are agents {mates}.\n"
+                    #f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
                 )
 
                 for idx in range(0, len(self.agents)):
@@ -346,7 +349,17 @@ class AgentHandler:
                     if teammate.last_target == -1:
                         teammate_target = "Unknown"
                     else:
-                        teammate_target = f"{teammate.last_target}"#, and is {teammate.distance_to_last_target(self.environment):.0f} meters away."
+
+                        target_type = ""
+                        if teammate.last_target is not None:
+                            match self.environment.target_locations[teammate.last_target].target_type:
+                                case TargetType.EXCLUSIVE: target_type = "Exclusive"
+                                case TargetType.JOINT: target_type = "Joint"
+                                case TargetType.SEQUENTIAL: target_type = "Sequential"
+                                case _:
+                                    print(f"Warning! Invalid target type! Target type was {self.environment.target_locations[teammate.last_target].target_type}")
+
+                        teammate_target = f"{target_type} {teammate.last_target}"#, and is {teammate.distance_to_last_target(self.environment):.0f} meters away."
                     update_message += (
                         f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
                         f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n\n"
@@ -357,12 +370,19 @@ class AgentHandler:
                         all_targets_visited = False
                         break
                 if not all_targets_visited:
-                    update_message += "\nThe following targets have yet to be visited:\n"
+                    pending_lines = []
                     for idx, target in enumerate(self.environment.target_locations):
                         if target.visited:
                             continue
-                        #status = "VISITED" if target.visited else "NOT VISITED"
-                        update_message += f"TARGET {idx}: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, Total Distance: {geo.geometric_mean_3d(agent.location[0], agent.location[1], agent.location[2], target.north_m, target.east_m, target.alt):.0f} meters away.\n"
+                        # Sequential: a drone that already counted toward it isn't told it's unvisited
+                        if target.target_type == TargetType.SEQUENTIAL and agent_index in target.visitors:
+                            continue
+                        pending_lines.append(f"TARGET {idx}: {target.target_type.value}\n")
+
+                    if pending_lines:
+                        update_message += "\nThe following targets have yet to be visited:\n" + "".join(pending_lines)
+                    else:
+                        update_message += "\nYou have already visited every remaining target. They are waiting on other drones.\n"
                 else:
                     update_message += (
                         "\nAll targets have been visited. The mission is not complete until every drone is back at "
@@ -384,6 +404,50 @@ class AgentHandler:
     # Check if the agents all decided to go home and do nothing
     def check_stalled(self):
         return all(agent.inaction for agent in self.agents)
+
+    def should_prompt(self, agent) -> bool:
+        """Decide whether this agent needs a new decision this round."""
+        # Recalled/inactive agents are never prompted
+        if agent.inaction or agent.target_index == "Home":
+            return False
+
+        # Doing nothing: never assigned (-1) or chose IDLE (None)
+        if agent.target_index is None or agent.target_index == -1:
+            return True
+
+        target = self.environment.target_locations[agent.target_index]
+
+        # Arrived at its intended location
+        if geo.point_distance(agent.location, target.get_location()) < VISIT_RADIUS_METERS:
+            return True
+
+        if target.cleared:
+            return True
+
+        # Target no longer needs this drone (already cleared, or too many drones assigned)
+        return self._is_surplus(agent, target)
+
+    def _is_surplus(self, agent, target) -> bool:
+        sequential = target.target_type == TargetType.SEQUENTIAL
+
+        # Sequential counts distinct drones, so a drone that already counted adds nothing by returning
+        if sequential and agent.agent_index in target.visitors:
+            return True
+
+        rivals = [
+            a for a in self.agents
+            if a.target_index == agent.target_index
+            and not a.inaction
+            and not (sequential and a.agent_index in target.visitors)
+        ]
+        slots = target.slots_remaining()
+        if len(rivals) <= slots:
+            return False
+
+        # Keep the closest drones on the task; only the surplus (farthest) ones get re-prompted
+        target_location = target.get_location()
+        rivals.sort(key=lambda a: (geo.point_distance(a.location, target_location), a.agent_index))
+        return agent not in rivals[:slots]
 
 
 def repair_json_newlines(text):

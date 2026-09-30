@@ -15,7 +15,7 @@ import queue
 import find_optimal
 import math
 
-from environment import Environment
+from environment import Environment, TargetType
 
 class Simulation:
 
@@ -90,6 +90,7 @@ class Simulation:
                 return False
         return False
 
+
     def show_map(self):
         # Define bounds of the map
         half_size = self.area_size_m/2
@@ -139,8 +140,14 @@ class Simulation:
             agent.scatter_pointer = self.ax.scatter(lon, lat, color="c", zorder=6, s=100)
 
 
+        #TODO: Different colors for different target types
         for target in self.environment.target_locations:
-            color = "gray" if target.visited else "r"
+            color = "gray"
+            if not target.visited:
+                match target.target_type:
+                    case TargetType.EXCLUSIVE: color = "red"
+                    case TargetType.JOINT: color = "green"
+                    case TargetType.SEQUENTIAL: color = "purple"
             lat, lon, _ = geo.local_to_latlon(target.north_m, target.east_m, target.alt, self.center_lat, self.center_lon)
             target.scatter_pointer = self.ax.scatter(lon, lat, color=color, zorder=5, s=100)
 
@@ -199,7 +206,7 @@ if __name__ == "__main__":
     sim.show_map()
 
     # Find the optimal solution, for comparison
-    optimal_rounds = math.ceil(sim.find_optimal() / sim.handler.drone_velocity)
+    optimal_rounds = -1#math.ceil(sim.find_optimal() / sim.handler.drone_velocity)
 
     # Threading agent to help redraw the plot
     worker = threading.Thread(target=agent_worker, daemon=True)
