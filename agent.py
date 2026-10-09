@@ -6,13 +6,15 @@ import os
 import csv
 import random
 
-log_path = "log.csv"
-summary_log_path = "summary_log.csv"
+log_path = "/home/jdmcfadd/TUCLAR-Simulation/log.csv"
+summary_log_path = "/home/jdmcfadd/TUCLAR-Simulation/summary_log.csv"
 VELOCITY_METERS_SECOND = 100
+HISTORY_TURNS = 15
 
 
 # Handles LLM calls & message history
 class Agent:
+
 
     def __init__(self, system_prompt: str, client, model: str, start_location: [float, float, float], agent_index=-1):
         self.history = [{"role": "system", "content": system_prompt}]
@@ -27,21 +29,28 @@ class Agent:
         self.inaction = False
         self.distance_traveled = 0.0
         self.displayed_message = "Yet to act, no message for now."
-        #self.next_message = ""
+        self.recent = []
 
 
     def generate_response(self, message):
-        self.history.append({"role": "user", "content": message})
+        messages = self.history + self.recent + [{"role": "user", "content": message}]
         response = self.client.chat.completions.create(
             model=self.model,
-            messages=self.history,
-            extra_body={"chat_template_kwargs": {"thinking": False}},
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.0,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         content = response.choices[0].message.content
-        if content:
-            self.history.append({"role": "assistant", "content": f"{content.strip()}\n\n"})
-        return content
 
+        parsed = extract_json_object(content)
+        if parsed is not None and HISTORY_TURNS > 0:
+            self.recent += [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": json.dumps(parsed)},
+            ]
+            self.recent = self.recent[-2 * HISTORY_TURNS:]
+        return content
     # Advance position according to velocity
     def step(self):
         step_distance = geo.point_distance([0, 0, 0], self.velocity)  # magnitude of velocity this round
@@ -78,15 +87,12 @@ class AgentHandler:
         #        )
         #self.LLM_tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-4-mini-instruct", clean_up_tokenization_spaces=False)
         #self.pipe = pipeline("text-generation", model=self.LLM_model, tokenizer=self.LLM_tokenizer)
-        self.client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
-            api_key=os.environ["NVIDIA_API_KEY"],
-        )
+        self.client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
         #"nvidia/nemotron-3.5-lightning-30b-a3b"
         #mistralai/mistral-nemotron
-        self.model = "nvidia/nemotron-3.5-lightning-30b-a3b"
+        self.model = os.environ["MODEL"]
 
-        self.generation_args = {"max_tokens": 512, "return_full_text": False, "temperature": False}
+        self.generation_args = {"max_tokens": 512, "temperature": 0.0}
 
         self.scenario = scenario
         self.environment = environment
@@ -123,7 +129,7 @@ Reply with a single JSON object and nothing else:
   "role":    "<is ownership overlapping (you and the other agents all work the same targets/resources -> coordinate) or divided (your role owns some stages/stations, the others own the rest -> execute your own), and why>",
   "task":    "<for each pending shared target, how it couples you -- Joint / Exclusive / Sequential>",
   "plan":    "<overlapping: apply the matching rule per target over the canonical order -- Joint: converge on the first such target; Exclusive: your role's share; Sequential: your stage; divided: the most useful step within your own part (enabling step or next unit if none ready), not a step that belongs to another agent's part>",
-  "message": "<whatever you enter here may or may not reach your teammates. communication is unreliable in this scenario, but try your best to collaborate>"
+  "message": "<whatever you enter here may or may not reach your teammates. communication is unreliable in this scenario, but try your best to collaborate>",
   "action":  "<copy one action verbatim from your currently-legal actions>"
 }\n
 
@@ -240,13 +246,9 @@ Reply with a single JSON object and nothing else:
         print()
 
         agent = self.agents[agent_index]
-        try:
-            if "{" in response and "}" in response:
-                first_open = response.index("{")
-                last_close = response.rindex("}")
-                response = response[first_open:last_close + 1]
-            data = json.loads(response)
+        data = extract_json_object(response)
 
+        if not (data is None):
             #IDLE: Set velocity to zero.
             #FLY X: Set velocity similar to previous implementation
             #RECALL: Set inaction to True, set velocity to go back to start.
@@ -273,12 +275,9 @@ Reply with a single JSON object and nothing else:
             else:
                 self.agents[agent_index].displayed_message = "Communication Failure."
 
-        except json.JSONDecodeError:
-            print(f"Invalid JSON response: {response}")
-
     # Set velocity to go towards the target.
     def update_velocity(self, agent):
-        if agent.target_index is None:
+        if agent.target_index is None or agent.target_index == -1:
             agent.velocity = [0, 0, 0]
             return
 
@@ -326,13 +325,6 @@ Reply with a single JSON object and nothing else:
                 )
             case 1:
                 mates = ", ".join(str(j) for j in range(self.num_agents) if j != agent_index)
-                update_message += (
-                    f"## Who you are\n"
-                    f"You are **agent {agent_index}**; your teammates are agents {mates}. "
-                    f"All {self.num_agents} of you reason in exactly the same way -- your role label is the only "
-                    f"thing that distinguishes you.\n\n"
-                    f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
-                )
 
                 for idx in range(0, len(self.agents)):
                     if idx == agent_index or self.agents[idx].inaction:
@@ -380,3 +372,19 @@ Reply with a single JSON object and nothing else:
     # Check if the agents all decided to go home and do nothing
     def check_stalled(self):
         return all(agent.inaction for agent in self.agents)
+
+def extract_json_object(text):
+    """Return the last parseable JSON object containing "action"; ignores braces in reasoning text."""
+    if not text:
+        return None
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    decoder = json.JSONDecoder()
+    for start in reversed([i for i, ch in enumerate(text) if ch == "{"]):
+        try:
+            obj, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "action" in obj:
+            return obj
+    return None

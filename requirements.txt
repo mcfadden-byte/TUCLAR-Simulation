@@ -1,7 +1,7 @@
 contextily==1.7.1
 geopandas==1.1.4
 haversine==2.9.0
-herbie==1.0b2
+herbie-data
 matplotlib==3.11.2
 numpy==2.4.6
 osmnx==2.1.1
@@ -11,5 +11,5 @@ pyproj==3.7.2
 rtree==1.4.1
 Shapely==2.1.2
 xarray==2026.7.0
-PyQt5
 openai==3.14.1
+pymap3d
