@@ -1,23 +1,104 @@
-from environment import Environment
+from environment import Environment, TargetType, VISIT_RADIUS_METERS
 import json
 import utils_geometry as geo
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 import os
 import csv
 import random
 
-log_path = "/home/jdmcfadd/TUCLAR-Simulation/log.csv"
-summary_log_path = "/home/jdmcfadd/TUCLAR-Simulation/summary_log.csv"
-VELOCITY_METERS_SECOND = 100
-HISTORY_TURNS = 15
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# Backend: defaults to a local vLLM server (the cluster). For the hosted NVIDIA API:
+#   export LLM_BASE_URL=https://integrate.api.nvidia.com/v1
+#   export NVIDIA_API_KEY=nvapi-...
+#   export MODEL=nvidia/nemotron-3-ultra-550b-a55b      (optional; this is the default)
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
+LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
+LLM_MODEL = os.environ.get("MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+MAX_TOKENS = 1024
+TEMPERATURE = 0.0
+
+# Past exchanges each agent remembers (0 = stateless). Every observation is a full snapshot,
+# so this can stay small; large values overflow a 16k-token context.
+HISTORY_TURNS = 2
+
+# CSV logs go here. Set LOG_DIR to write each experiment to its own folder.
+LOG_DIR = os.environ.get("LOG_DIR", ".")
+log_path = os.path.join(LOG_DIR, "log.csv")
+summary_log_path = os.path.join(LOG_DIR, "summary_log.csv")
+
+# --- Experiment switches (the two copies disagreed; defaults follow the local copy) ---
+PROMPT_STYLE = "short"        # "short": thought/message/action  |  "framework": state/role/task/plan/message/action
+SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
+SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT_SHORT = """
+Your output must be in valid JSON format. Do not output anything else.
+Your JSON must have "thought", "message", and "action" components.
+You can communicate to your teammates through "message", but they may or may not receive it.
+
+Example VALID output: {"thought": "Teammate 3 is already going to target 4, so I will go to target 2", "message": "I will go to target 2, nobody else needs to go there.", "action": "FLY 2"}
+Example INVALID output: {"thought": {"reason": "Target 4 is busy", "goal": "Visit all targets"}, "action": {"FLY": 2}}
+"""
+
+SYSTEM_PROMPT_FRAMEWORK = """
+## Coordinating from the shared observation
+Decide from the observation you and the other agents all see: reading the same scene and reasoning alike, a rule anchored to that scene leads you all to the same division of labor.
+
+**Role.** Read the ownership: is it overlapping -- do you and the other agents all work the same targets and resources -- or is it divided, each of you already holding its own part?
+  - **Overlapping** (acting alike you would contend for one target or all defer): coordinate -- settle a division of labor over the shared targets from the scene.
+  - **Divided** (your role owns some stages/stations and the other agents own the rest): hold your part and execute. Take the single most useful action within your own part; do not step onto a station or task that belongs to another agent's part, even if it looks like the most useful step right now -- reading the same scene, they are already taking it, so you would only collide. If your own part has no ready step (it waits on their output), do its enabling step or start the next independent unit; wait only when nothing of yours is productive.
+
+**Task.** Settle the division over the shared targets: read how each pending target couples you and apply its rule over the canonical order:
+  1. **Joint** (succeeds only if you all act on it together): converge -- all take the same one: the first such target in that order. (Acting alone wastes it.)
+  2. **Exclusive** (single-occupancy -- multiple acting on it wastes it): divide by item -- take your share by role over that order; the other agents take the complement, so you never collide.
+  3. **Sequential** (ordered hand-off chain): divide by stage -- work the stage your role owns, by the chain order.
+
+## Reply format
+Reply with a single JSON object and nothing else:
+
+{
+  "state":   "<from the observation only: what you hold + which steps are doable now (inputs present); world state, never the other agents' intent>",
+  "role":    "<is ownership overlapping (you and the other agents all work the same targets/resources -> coordinate) or divided (your role owns some stages/stations, the others own the rest -> execute your own), and why>",
+  "task":    "<for each pending shared target, how it couples you -- Joint / Exclusive / Sequential>",
+  "plan":    "<overlapping: apply the matching rule per target over the canonical order -- Joint: converge on the first such target; Exclusive: your role's share; Sequential: your stage; divided: the most useful step within your own part (enabling step or next unit if none ready), not a step that belongs to another agent's part>",
+  "message": "<whatever you enter here may or may not reach your teammates. communication is unreliable in this scenario, but try your best to collaborate>",
+  "action":  "<copy one action verbatim from your currently-legal actions>"
+}
+"""
+
+SYSTEM_PROMPTS = {"short": SYSTEM_PROMPT_SHORT, "framework": SYSTEM_PROMPT_FRAMEWORK}
+
+
+# Tolerates raw newlines inside JSON strings (a failure the model produces now and then)
+_decoder = json.JSONDecoder(strict=False)
+
+def extract_json_object(text):
+    """Return the last parseable JSON object containing "action"; ignores braces in reasoning text."""
+    if not text:
+        return None
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    for start in reversed([i for i, ch in enumerate(text) if ch == "{"]):
+        try:
+            obj, _ = _decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "action" in obj:
+            return obj
+    return None
 
 
 # Handles LLM calls & message history
 class Agent:
 
-
     def __init__(self, system_prompt: str, client, model: str, start_location: [float, float, float], agent_index=-1):
         self.history = [{"role": "system", "content": system_prompt}]
+        self.recent = []  # last HISTORY_TURNS exchanges, stored compactly
         self.client = client
         self.model = model
         self.location = start_location # Distance North from center, distance East from center, altitude
@@ -29,28 +110,43 @@ class Agent:
         self.inaction = False
         self.distance_traveled = 0.0
         self.displayed_message = "Yet to act, no message for now."
-        self.recent = []
 
+
+    def _create(self, messages):
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            # Different Nemotron chat templates use different flag names; each ignores the other's.
+            extra_body={"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
+        )
 
     def generate_response(self, message):
         messages = self.history + self.recent + [{"role": "user", "content": message}]
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.0,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
+        try:
+            response = self._create(messages)
+        except BadRequestError as e:
+            # Context overflow: forget remembered turns and retry once
+            if "context length" in str(e).lower() and self.recent:
+                self.recent = []
+                response = self._create(self.history + [{"role": "user", "content": message}])
+            else:
+                raise
         content = response.choices[0].message.content
 
         parsed = extract_json_object(content)
         if parsed is not None and HISTORY_TURNS > 0:
             self.recent += [
                 {"role": "user", "content": message},
-                {"role": "assistant", "content": json.dumps(parsed)},
+                {"role": "assistant", "content": json.dumps({
+                    "action": parsed.get("action", ""),
+                    "message": parsed.get("message", ""),
+                })},
             ]
             self.recent = self.recent[-2 * HISTORY_TURNS:]
         return content
+
     # Advance position according to velocity
     def step(self):
         step_distance = geo.point_distance([0, 0, 0], self.velocity)  # magnitude of velocity this round
@@ -79,61 +175,16 @@ class AgentHandler:
 
     # Initiates the AI, creates the system prompts, initializes variables
     def __init__(self, num_agents: int, scenario: int, environment: Environment):
-        #self.LLM_model = AutoModelForCausalLM.from_pretrained(
-        #        "microsoft/Phi-4-mini-instruct",
-        #        device_map="auto",
-        #        torch_dtype="auto",
-        #        trust_remote_code=False,
-        #        )
-        #self.LLM_tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-4-mini-instruct", clean_up_tokenization_spaces=False)
-        #self.pipe = pipeline("text-generation", model=self.LLM_model, tokenizer=self.LLM_tokenizer)
-        self.client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
-        #"nvidia/nemotron-3.5-lightning-30b-a3b"
-        #mistralai/mistral-nemotron
-        self.model = os.environ["MODEL"]
-
-        self.generation_args = {"max_tokens": 512, "temperature": 0.0}
+        self.client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+        self.model = LLM_MODEL
 
         self.scenario = scenario
         self.environment = environment
         self.num_rounds = 0
         self.comms_quality = 0.5
+        self.drone_velocity = 100
 
-
-#        self.system_prompt = """
-#            Your output must be in valid JSON format. Do not output anything else.
-#            Your JSON must have "thought" and "action" components.
-
-#            Example VALID output: {"thought": "Teammate 3 is already going to target 4, so I will go to target 2", "action": "FLY 2"}
-#            Example INVALID output: {"thought": {"reason": "Target 4 is busy", "goal": "Visit all targets"}, "action": {"FLY": 2}}
-#        """
-
-        self.system_prompt = """
-## Coordinating from the shared observation
-Decide from the observation you and the other agents all see: reading the same scene and reasoning alike, a rule anchored to that scene leads you all to the same division of labor.
-
-**Role.** Read the ownership: is it overlapping -- do you and the other agents all work the same targets and resources -- or is it divided, each of you already holding its own part?
-  - **Overlapping** (acting alike you would contend for one target or all defer): coordinate -- settle a division of labor over the shared targets from the scene.
-  - **Divided** (your role owns some stages/stations and the other agents own the rest): hold your part and execute. Take the single most useful action within your own part; do not step onto a station or task that belongs to another agent's part, even if it looks like the most useful step right now -- reading the same scene, they are already taking it, so you would only collide. If your own part has no ready step (it waits on their output), do its enabling step or start the next independent unit; wait only when nothing of yours is productive.
-
-**Task.** Settle the division over the shared targets: read how each pending target couples you and apply its rule over the canonical order:
-  1. **Joint** (succeeds only if you all act on it together): converge -- all take the same one: the first such target in that order. (Acting alone wastes it.)
-  2. **Exclusive** (single-occupancy -- multiple acting on it wastes it): divide by item -- take your share by role over that order; the other agents take the complement, so you never collide.
-  3. **Sequential** (ordered hand-off chain): divide by stage -- work the stage your role owns, by the chain order.
-
-## Reply format
-Reply with a single JSON object and nothing else:
-
-{
-  "state":   "<from the observation only: what you hold + which steps are doable now (inputs present); world state, never the other agents' intent>",
-  "role":    "<is ownership overlapping (you and the other agents all work the same targets/resources -> coordinate) or divided (your role owns some stages/stations, the others own the rest -> execute your own), and why>",
-  "task":    "<for each pending shared target, how it couples you -- Joint / Exclusive / Sequential>",
-  "plan":    "<overlapping: apply the matching rule per target over the canonical order -- Joint: converge on the first such target; Exclusive: your role's share; Sequential: your stage; divided: the most useful step within your own part (enabling step or next unit if none ready), not a step that belongs to another agent's part>",
-  "message": "<whatever you enter here may or may not reach your teammates. communication is unreliable in this scenario, but try your best to collaborate>",
-  "action":  "<copy one action verbatim from your currently-legal actions>"
-}\n
-
-        """
+        self.system_prompt = SYSTEM_PROMPTS[PROMPT_STYLE]
 
         self.scenario_system_prompts = {
 
@@ -146,14 +197,15 @@ Reply with a single JSON object and nothing else:
             1: """
                 MISSION REQUIREMENTS:
                     1. There is a series of locations that you will be given.
-                    2. You will have a series of teammates. You know where they are going, but you cannot communicate with them.
-                    3. The mission is a success once all given locations have been visited at least once by you or a teammate, AND all drones have gone back to their start location.
-                    4. Complete the mission as quick as possible. There is no benefit to visiting the same location multiple times.
-                    5. Pick ONE location to visit at a time. You have 3 available actions:
+                    2. You will have a series of teammates. You know where they are going, but you cannot communicate with them. All your teammates reason exactly the same as you.
+                    3. The mission is a success once all target locations are cleared, and you have used the RECALL action to go back to start.
+                    4. There are three types of target location: Sequential, which must be visited by three different agents at any point (you do not need to all visit at the same time). Joint, which must be visited by two different agents at the *same time*. And Exclusive, which must be visited by any agent.
+                    5. Complete the mission as quick as possible.
+                    6. Pick ONE location to visit at a time. You have 3 available actions:
                             "IDLE": Do nothing.
                             "FLY 0", "FLY 1", "FLY 2"...: Travel to the target with the given index.
                             "RECALL": Go back to your starting location.
-                    6. It takes multiple rounds for you to travel to a location. You may need to use the FLY action multiple times on the same target before you arrive.
+                    7. It takes multiple rounds for you to travel to a location. You may need to use the FLY action multiple times on the same target before you arrive. Do not assume a target has been visited until it has been cleared from the target list.
             """
         }
 
@@ -179,15 +231,17 @@ Reply with a single JSON object and nothing else:
         revisited = sum(1 for t in targets if len(t.visitors) > 1)
         return revisited / len(targets)
 
-    def log_summary(self, success: bool):
-        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality"]
+    def log_summary(self, success: bool, optimal_length=-1):
+        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality", "optimal_solution_length"]
         row = [
             f"{self.get_total_distance_traveled():.2f}",
             f"{self.get_revisit_rate():.4f}",
             success,
             self.num_rounds,
             self.comms_quality,
+            optimal_length
         ]
+        os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)
         file_exists = os.path.exists(self.summary_log_path)
         with open(self.summary_log_path, "a", newline="") as f:
             writer = csv.writer(f)
@@ -198,6 +252,7 @@ Reply with a single JSON object and nothing else:
     def init_log(self):
         header = [f"agent{i}" for i in range(self.num_agents)] + \
                  [f"target{i}" for i in range(len(self.environment.target_locations))]
+        os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
         with open(self.log_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
@@ -220,9 +275,12 @@ Reply with a single JSON object and nothing else:
 
     # Update all agents on the situation, ask for a new course of action (or continue the current one)
     def update_agents(self):
-        for idx in range(0, self.num_agents):
-            if not self.agents[idx].inaction:
-                self.parse_response(self.agents[idx].generate_response(self.generate_update_message(idx)), idx)
+        # Snapshot who needs a decision before any responses change targets
+        to_prompt = [idx for idx in range(self.num_agents) if self.should_prompt(self.agents[idx])]
+        print(f"Round {self.num_rounds}: prompting agents {to_prompt}")
+
+        for idx in to_prompt:
+            self.parse_response(self.agents[idx].generate_response(self.generate_update_message(idx)), idx)
 
         for idx in range(0, self.num_agents):
             if not self.agents[idx].inaction:
@@ -231,7 +289,6 @@ Reply with a single JSON object and nothing else:
         for agent in self.agents:
             self.update_velocity(agent)
             agent.step()
-            #agent.displayed_message = agent.next_message
 
         self.environment.check_visits(self.agents)
         self.log_round()
@@ -247,33 +304,35 @@ Reply with a single JSON object and nothing else:
 
         agent = self.agents[agent_index]
         data = extract_json_object(response)
+        if data is None:
+            print(f"Invalid JSON response (tail): {response[-300:]}")
+            return
 
-        if not (data is None):
-            #IDLE: Set velocity to zero.
-            #FLY X: Set velocity similar to previous implementation
-            #RECALL: Set inaction to True, set velocity to go back to start.
-            action = data.get("action", "")
-            if action == "IDLE":
-                agent.target_index = None
-            elif action == "RECALL":
-                agent.target_index = "Home"
-                agent.inaction = True
-            elif action.startswith("FLY "):
-                try:
-                    index = int(action.removeprefix("FLY "))
-                    if 0 <= index < len(self.environment.target_locations):
-                        agent.target_index = index
-                    else:
-                        print(f"Agent {agent_index} gave out-of-range FLY index: {index}")
-                except ValueError:
-                    print(f"Agent {agent_index} gave malformed FLY action: {action!r}")
-            else:
-                print(f"Agent {agent_index} gave unrecognized action: {action!r}")
+        #IDLE: Set velocity to zero.
+        #FLY X: Set velocity similar to previous implementation
+        #RECALL: Set inaction to True, set velocity to go back to start.
+        action = str(data.get("action", ""))
+        if action == "IDLE":
+            agent.target_index = None
+        elif action == "RECALL":
+            agent.target_index = "Home"
+            agent.inaction = True
+        elif action.startswith("FLY "):
+            try:
+                index = int(action.removeprefix("FLY "))
+                if 0 <= index < len(self.environment.target_locations):
+                    agent.target_index = index
+                else:
+                    print(f"Agent {agent_index} gave out-of-range FLY index: {index}")
+            except ValueError:
+                print(f"Agent {agent_index} gave malformed FLY action: {action!r}")
+        else:
+            print(f"Agent {agent_index} gave unrecognized action: {action!r}")
 
-            if random.random() < self.comms_quality:
-                self.agents[agent_index].displayed_message = data.get("message", "")
-            else:
-                self.agents[agent_index].displayed_message = "Communication Failure."
+        if random.random() < self.comms_quality:
+            agent.displayed_message = data.get("message", "")
+        else:
+            agent.displayed_message = "Communication Failure."
 
     # Set velocity to go towards the target.
     def update_velocity(self, agent):
@@ -286,7 +345,7 @@ Reply with a single JSON object and nothing else:
             if distance < 1:
                 agent.velocity = [0, 0, 0]
                 return
-            speed = min(VELOCITY_METERS_SECOND, distance)
+            speed = min(self.drone_velocity, distance)
             scale = speed / distance
             agent.velocity = [-d * scale for d in agent.location]
             return
@@ -303,7 +362,7 @@ Reply with a single JSON object and nothing else:
                 return
 
             delta = [target_location[i] - agent.location[i] for i in range(3)]
-            speed = min(VELOCITY_METERS_SECOND, distance)
+            speed = min(self.drone_velocity, distance)
             scale = speed / distance
             agent.velocity = [d * scale for d in delta]
 
@@ -325,6 +384,9 @@ Reply with a single JSON object and nothing else:
                 )
             case 1:
                 mates = ", ".join(str(j) for j in range(self.num_agents) if j != agent_index)
+                update_message += f"You are **agent {agent_index}**; your teammates are agents {mates}.\n"
+                if SHOW_OWN_LOCATION:
+                    update_message += f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
 
                 for idx in range(0, len(self.agents)):
                     if idx == agent_index or self.agents[idx].inaction:
@@ -333,8 +395,11 @@ Reply with a single JSON object and nothing else:
                     teammate_target: str
                     if teammate.last_target == -1:
                         teammate_target = "Unknown"
+                    elif teammate.last_target is None:
+                        teammate_target = "None (idle)"
                     else:
-                        teammate_target = f"{teammate.last_target}"#, and is {teammate.distance_to_last_target(self.environment):.0f} meters away."
+                        mate_target = self.environment.target_locations[teammate.last_target]
+                        teammate_target = f"{mate_target.target_type.value} {teammate.last_target}"
                     update_message += (
                         f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
                         f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n\n"
@@ -345,12 +410,23 @@ Reply with a single JSON object and nothing else:
                         all_targets_visited = False
                         break
                 if not all_targets_visited:
-                    update_message += "\nThe following targets have yet to be visited:\n"
+                    pending_lines = []
                     for idx, target in enumerate(self.environment.target_locations):
                         if target.visited:
                             continue
-                        #status = "VISITED" if target.visited else "NOT VISITED"
-                        update_message += f"TARGET {idx}: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, Total Distance: {geo.geometric_mean_3d(agent.location[0], agent.location[1], agent.location[2], target.north_m, target.east_m, target.alt):.0f} meters away.\n"
+                        # Sequential: a drone that already counted toward it isn't told it's unvisited
+                        if target.target_type == TargetType.SEQUENTIAL and agent_index in target.visitors:
+                            continue
+                        line = f"TARGET {idx}: {target.target_type.value}"
+                        if SHOW_TARGET_COORDS:
+                            distance = geo.point_distance(agent.location, target.get_location())
+                            line += f", X={target.north_m:.1f}m, Y={target.east_m:.1f}m, Total Distance: {distance:.0f} meters away."
+                        pending_lines.append(line + "\n")
+
+                    if pending_lines:
+                        update_message += "\nThe following targets have yet to be visited:\n" + "".join(pending_lines)
+                    else:
+                        update_message += "\nYou have already visited every remaining target. They are waiting on other drones.\n"
                 else:
                     update_message += (
                         "\nAll targets have been visited. The mission is not complete until every drone is back at "
@@ -373,18 +449,46 @@ Reply with a single JSON object and nothing else:
     def check_stalled(self):
         return all(agent.inaction for agent in self.agents)
 
-def extract_json_object(text):
-    """Return the last parseable JSON object containing "action"; ignores braces in reasoning text."""
-    if not text:
-        return None
-    if "</think>" in text:
-        text = text.rsplit("</think>", 1)[1]
-    decoder = json.JSONDecoder()
-    for start in reversed([i for i, ch in enumerate(text) if ch == "{"]):
-        try:
-            obj, _ = decoder.raw_decode(text[start:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and "action" in obj:
-            return obj
-    return None
+    def should_prompt(self, agent) -> bool:
+        """Decide whether this agent needs a new decision this round."""
+        # Recalled/inactive agents are never prompted
+        if agent.inaction or agent.target_index == "Home":
+            return False
+
+        # Doing nothing: never assigned (-1) or chose IDLE (None)
+        if agent.target_index is None or agent.target_index == -1:
+            return True
+
+        target = self.environment.target_locations[agent.target_index]
+
+        # Arrived at its intended location
+        if geo.point_distance(agent.location, target.get_location()) < VISIT_RADIUS_METERS:
+            return True
+
+        if target.cleared:
+            return True
+
+        # Target no longer needs this drone (already cleared, or too many drones assigned)
+        return self._is_surplus(agent, target)
+
+    def _is_surplus(self, agent, target) -> bool:
+        sequential = target.target_type == TargetType.SEQUENTIAL
+
+        # Sequential counts distinct drones, so a drone that already counted adds nothing by returning
+        if sequential and agent.agent_index in target.visitors:
+            return True
+
+        rivals = [
+            a for a in self.agents
+            if a.target_index == agent.target_index
+            and not a.inaction
+            and not (sequential and a.agent_index in target.visitors)
+        ]
+        slots = target.slots_remaining()
+        if len(rivals) <= slots:
+            return False
+
+        # Keep the closest drones on the task; only the surplus (farthest) ones get re-prompted
+        target_location = target.get_location()
+        rivals.sort(key=lambda a: (geo.point_distance(a.location, target_location), a.agent_index))
+        return agent not in rivals[:slots]

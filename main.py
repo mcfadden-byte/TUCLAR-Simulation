@@ -163,7 +163,7 @@ def agent_worker():
         response_queue.put("updated")
 
 
-if __name__ == "__main__":
+def run_simulation():
     # Metrics we'll use to measure the quality of success
     num_rounds: int
     num_visits: int
@@ -193,3 +193,7 @@ if __name__ == "__main__":
     success = sim.check_success()
     sim.handler.log_summary(success)
     print(f"Total rounds: {sim.handler.num_rounds}")
+
+if __name__ == "__main__":
+    for i in range(0,3):
+        run_simulation()
