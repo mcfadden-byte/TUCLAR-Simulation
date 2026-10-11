@@ -12,9 +12,11 @@ import time
 from agent import Agent, AgentHandler
 import threading
 import queue
-
+import os
 
 from environment import Environment
+
+HEADLESS = not os.environ.get("DISPLAY")
 
 class Simulation:
 
@@ -155,45 +157,53 @@ class Simulation:
 response_queue = queue.Queue()
 
 
-def agent_worker():
-    while not sim.window_closed:
-        if sim.check_success() or sim.check_failure():
-            break
-        sim.handler.update_agents()  # only the network-bound work happens here
-        response_queue.put("updated")
+def agent_worker(sim, response_queue):
+    try:
+        while not sim.window_closed:
+            if sim.check_success() or sim.check_failure():
+                break
+            sim.handler.update_agents()  # only the network-bound work happens here
+            response_queue.put("updated")
+    except Exception:
+        import traceback; traceback.print_exc()
 
-
-def run_simulation():
-    # Metrics we'll use to measure the quality of success
-    num_rounds: int
-    num_visits: int
-
-
-    sim = Simulation(scenario=1, center_lat=44.6883889, center_lon=-111.1176389, area_size_m=2500)
-    sim.init_scenario()
-    sim.init_handler()
-    sim.show_map()
-
-    worker = threading.Thread(target=agent_worker, daemon=True)
-    worker.start()
-
-    # Simulation loop: simulates in rounds, where the drones can move a certain distance each round.
-    # Check if success condition has been met (break if true)
-    # If a drone is not in the middle of a task, ask the associated agent for the next task.
-    # Redraw the map
-    while not sim.window_closed:
-        try:
-            response_queue.get(timeout=0.1)
-            sim.update_object_positions()
-        except queue.Empty:
-            pass
-        sim.fig.canvas.flush_events()
-        time.sleep(0.05)
-
-    success = sim.check_success()
-    sim.handler.log_summary(success)
-    print(f"Total rounds: {sim.handler.num_rounds}")
 
 if __name__ == "__main__":
     for i in range(0,3):
-        run_simulation()
+        # Metrics we'll use to measure the quality of success
+        num_rounds: int
+        num_visits: int
+
+
+        sim = Simulation(scenario=1, center_lat=44.6883889, center_lon=-111.1176389, area_size_m=2500)
+        sim.init_scenario()
+        sim.init_handler()
+        sim.show_map()
+
+        response_queue = queue.Queue()
+        worker = threading.Thread(target=agent_worker, args=(sim, response_queue), daemon=True)
+        worker.start()
+
+        # Simulation loop: simulates in rounds, where the drones can move a certain distance each round.
+        # Check if success condition has been met (break if true)
+        # If a drone is not in the middle of a task, ask the associated agent for the next task.
+        # Redraw the map
+        if HEADLESS:
+            worker.join()
+        else:
+            while not sim.window_closed and (worker.is_alive() or not response_queue.empty()):
+                try:
+                    response_queue.get(timeout=0.1)
+                    sim.update_object_positions()
+                except queue.Empty:
+                    pass
+                sim.fig.canvas.flush_events()
+                time.sleep(0.05)
+            plt.close(sim.fig)
+
+        success = sim.check_success()
+        sim.handler.log_summary(success)
+        print(f"Finished round {i}, Total rounds: {sim.handler.num_rounds}")
+
+        if sim.window_closed:
+            break
