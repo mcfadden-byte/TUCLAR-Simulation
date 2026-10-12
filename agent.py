@@ -5,6 +5,7 @@ from openai import OpenAI, BadRequestError
 import os
 import csv
 import random
+import time
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -19,9 +20,8 @@ LLM_MODEL = os.environ.get("MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 MAX_TOKENS = 1024
 TEMPERATURE = 0.0
 
-# Past exchanges each agent remembers (0 = stateless). Every observation is a full snapshot,
-# so this can stay small; large values overflow a 16k-token context.
-HISTORY_TURNS = 2
+# Past exchanges each agent remembers (0 = stateless).
+HISTORY_TURNS = 5
 
 # CSV logs go here. Set LOG_DIR to write each experiment to its own folder.
 LOG_DIR = os.environ.get("LOG_DIR", ".")
@@ -40,8 +40,9 @@ SYSTEM_PROMPT_SHORT = """
 Your output must be in valid JSON format. Do not output anything else.
 Your JSON must have "thought", "message", and "action" components.
 You can communicate to your teammates through "message", but they may or may not receive it.
+In the thought section of the JSON, output the ideal actions for the group as a whole to take, not just yourself.
 
-Example VALID output: {"thought": "Teammate 3 is already going to target 4, so I will go to target 2", "message": "I will go to target 2, nobody else needs to go there.", "action": "FLY 2"}
+Example VALID output: {"thought": "Teammate 3 is already going to target 4, so I will go to target 2. Teammate 1 is currently idle, and it would be more helpful if they went to help Teammate 4 take care of Target 9.", "message": "I will go to target 2, nobody else needs to go there.", "action": "FLY 2"}
 Example INVALID output: {"thought": {"reason": "Target 4 is busy", "goal": "Visit all targets"}, "action": {"FLY": 2}}
 """
 
@@ -110,6 +111,7 @@ class Agent:
         self.inaction = False
         self.distance_traveled = 0.0
         self.displayed_message = "Yet to act, no message for now."
+        self.response_times = []
 
 
     def _create(self, messages):
@@ -124,6 +126,7 @@ class Agent:
 
     def generate_response(self, message):
         messages = self.history + self.recent + [{"role": "user", "content": message}]
+        started = time.perf_counter()
         try:
             response = self._create(messages)
         except BadRequestError as e:
@@ -133,6 +136,7 @@ class Agent:
                 response = self._create(self.history + [{"role": "user", "content": message}])
             else:
                 raise
+        self.response_times.append(time.perf_counter() - started)
         content = response.choices[0].message.content
 
         parsed = extract_json_object(content)
@@ -181,8 +185,11 @@ class AgentHandler:
         self.scenario = scenario
         self.environment = environment
         self.num_rounds = 0
-        self.comms_quality = 0.5
+        self.comms_quality = 0.5 #Set to 1 for perfect comms
+        self.comms_distance = 1000 #Set to -1 for infinite range
         self.drone_velocity = 100
+        self.sim_start = None
+        self.sim_end = None
 
         self.system_prompt = SYSTEM_PROMPTS[PROMPT_STYLE]
 
@@ -231,17 +238,43 @@ class AgentHandler:
         revisited = sum(1 for t in targets if len(t.visitors) > 1)
         return revisited / len(targets)
 
-    def log_summary(self, success: bool, optimal_length=-1):
-        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality", "optimal_solution_length"]
+    def get_sim_time(self):
+        """Seconds from the start of the first round to the end of the last one."""
+        if self.sim_start is None:
+            return 0.0
+        return self.sim_end - self.sim_start
+
+    def get_average_response_time(self):
+        """Mean LLM response time over every call made by every drone (None if no calls)."""
+        times = [t for agent in self.agents for t in agent.response_times]
+        return sum(times) / len(times) if times else None
+
+    def log_summary(self, success: bool, optimal=None):
+        header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality",
+                  "sim_time_seconds", "avg_response_seconds", "optimal_distance", "optimal_rounds"]
+        avg_response = self.get_average_response_time()
         row = [
             f"{self.get_total_distance_traveled():.2f}",
             f"{self.get_revisit_rate():.4f}",
             success,
             self.num_rounds,
             self.comms_quality,
-            optimal_length
+            f"{self.get_sim_time():.2f}",
+            "" if avg_response is None else f"{avg_response:.3f}",
+            "" if optimal is None else f"{optimal.distance:.2f}",
+            "" if optimal is None else optimal.rounds,
         ]
         os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)
+
+        # Columns changed since the last run? Keep the old file rather than mixing layouts.
+        if os.path.exists(self.summary_log_path):
+            with open(self.summary_log_path, newline="") as f:
+                existing_header = next(csv.reader(f), None)
+            if existing_header != header:
+                backup = f"{self.summary_log_path}.{int(time.time())}.bak"
+                os.rename(self.summary_log_path, backup)
+                print(f"Summary log columns changed; old log moved to {backup}")
+
         file_exists = os.path.exists(self.summary_log_path)
         with open(self.summary_log_path, "a", newline="") as f:
             writer = csv.writer(f)
@@ -275,6 +308,8 @@ class AgentHandler:
 
     # Update all agents on the situation, ask for a new course of action (or continue the current one)
     def update_agents(self):
+        if self.sim_start is None:
+            self.sim_start = time.perf_counter()
         # Snapshot who needs a decision before any responses change targets
         to_prompt = [idx for idx in range(self.num_agents) if self.should_prompt(self.agents[idx])]
         print(f"Round {self.num_rounds}: prompting agents {to_prompt}")
@@ -293,6 +328,7 @@ class AgentHandler:
         self.environment.check_visits(self.agents)
         self.log_round()
         self.num_rounds += 1
+        self.sim_end = time.perf_counter()
 
     # Interpret the response, search for which target the agent wants to head toward
     def parse_response(self, response: str, agent_index: int):
@@ -393,6 +429,7 @@ class AgentHandler:
                         continue
                     teammate = self.agents[idx]
                     teammate_target: str
+                    teammate_location = self.agents[idx].location
                     if teammate.last_target == -1:
                         teammate_target = "Unknown"
                     elif teammate.last_target is None:
@@ -400,10 +437,13 @@ class AgentHandler:
                     else:
                         mate_target = self.environment.target_locations[teammate.last_target]
                         teammate_target = f"{mate_target.target_type.value} {teammate.last_target}"
-                    update_message += (
-                        f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
-                        f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n\n"
-                    )
+                    update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
+                    
+                    if self.comms_distance == -1 or geo.geometric_mean_3d(teammate_location[0], teammate_location[1], teammate_location[2], agent.location[0], agent.location[1], agent.location[2]) <= self.comms_distance:
+                        update_message += f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n"
+                    else:
+                        update_message += f"TEAMMATE {idx} SAYS: Out of communication range.\n\n"
+
                 all_targets_visited = True
                 for idx, target in enumerate(self.environment.target_locations):
                     if target.visited == False:

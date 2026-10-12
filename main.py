@@ -153,6 +153,17 @@ class Simulation:
         self.window_closed = True
 
 
+    def find_optimal(self):
+        optimal = find_optimal.solve(self.environment, self.scenario,
+                                     len(self.handler.agents), self.handler.drone_velocity)
+        if optimal is None:
+            print("No optimal solution found")
+        else:
+            print(f"Best known solution: {optimal.distance:.0f} m, {optimal.rounds} rounds "
+                  f"({optimal.successes}/{optimal.iterations} runs succeeded)")
+        return optimal
+
+
 
 response_queue = queue.Queue()
 
@@ -169,7 +180,7 @@ def agent_worker(sim, response_queue):
 
 
 if __name__ == "__main__":
-    for i in range(0,3):
+    for i in range(0,1):
         # Metrics we'll use to measure the quality of success
         num_rounds: int
         num_visits: int
@@ -179,10 +190,12 @@ if __name__ == "__main__":
         sim.init_scenario()
         sim.init_handler()
         sim.show_map()
+        opteimal = sim.find_optimal()
 
         response_queue = queue.Queue()
         worker = threading.Thread(target=agent_worker, args=(sim, response_queue), daemon=True)
         worker.start()
+
 
         # Simulation loop: simulates in rounds, where the drones can move a certain distance each round.
         # Check if success condition has been met (break if true)
@@ -202,7 +215,7 @@ if __name__ == "__main__":
             plt.close(sim.fig)
 
         success = sim.check_success()
-        sim.handler.log_summary(success)
+        sim.handler.log_summary(successi, optimal)
         print(f"Finished round {i}, Total rounds: {sim.handler.num_rounds}")
 
         if sim.window_closed:
