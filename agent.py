@@ -21,7 +21,7 @@ MAX_TOKENS = 1024
 TEMPERATURE = 0.0
 
 # Past exchanges each agent remembers (0 = stateless).
-HISTORY_TURNS = 5
+HISTORY_TURNS = 3
 
 # CSV logs go here. Set LOG_DIR to write each experiment to its own folder.
 LOG_DIR = os.environ.get("LOG_DIR", ".")

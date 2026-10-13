@@ -13,6 +13,7 @@ from agent import Agent, AgentHandler
 import threading
 import queue
 import os
+import find_optimal
 
 from environment import Environment
 
@@ -180,7 +181,7 @@ def agent_worker(sim, response_queue):
 
 
 if __name__ == "__main__":
-    for i in range(0,1):
+    for i in range(0,50):
         # Metrics we'll use to measure the quality of success
         num_rounds: int
         num_visits: int
@@ -190,7 +191,7 @@ if __name__ == "__main__":
         sim.init_scenario()
         sim.init_handler()
         sim.show_map()
-        opteimal = sim.find_optimal()
+        optimal = sim.find_optimal()
 
         response_queue = queue.Queue()
         worker = threading.Thread(target=agent_worker, args=(sim, response_queue), daemon=True)
@@ -215,7 +216,7 @@ if __name__ == "__main__":
             plt.close(sim.fig)
 
         success = sim.check_success()
-        sim.handler.log_summary(successi, optimal)
+        sim.handler.log_summary(success, optimal)
         print(f"Finished round {i}, Total rounds: {sim.handler.num_rounds}")
 
         if sim.window_closed:
