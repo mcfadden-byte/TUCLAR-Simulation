@@ -84,6 +84,9 @@ class Simulation:
 
     # If all agents decided to go home and do nothing before the mission was complete, the mission is a failure.
     def check_failure(self):
+        if self.handler.num_rounds > 100:
+            printf("TIMEOUT: Simulation has been going on too long. Cutting it off and moving on.")
+            return True
         match self.scenario:
             case 1:
                 if self.handler.check_stalled() and not self.check_all_targets_visited():
