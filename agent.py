@@ -6,6 +6,7 @@ import os
 import csv
 import random
 import time
+from htn_planner import HTNPlanner, PlanningBudgetExceeded
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -19,6 +20,8 @@ LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
 LLM_MODEL = os.environ.get("MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 MAX_TOKENS = 1024
 TEMPERATURE = 0.0
+HTN_TIME_BUDGET_SECONDS = 0.5  # real-world seconds per drone, from its first HTN decision
+PLANNER_MODE = "llm"
 
 # Past exchanges each agent remembers (0 = stateless).
 HISTORY_TURNS = 3
@@ -29,7 +32,7 @@ log_path = os.path.join(LOG_DIR, "log.csv")
 summary_log_path = os.path.join(LOG_DIR, "summary_log.csv")
 
 # --- Experiment switches (the two copies disagreed; defaults follow the local copy) ---
-PROMPT_STYLE = "short"        # "short": thought/message/action  |  "framework": state/role/task/plan/message/action
+PROMPT_STYLE = "tos"        # "short": thought/message/action  |  "framework": state/role/task/plan/message/action
 SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
 SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
 
@@ -72,7 +75,28 @@ Reply with a single JSON object and nothing else:
 }
 """
 
-SYSTEM_PROMPTS = {"short": SYSTEM_PROMPT_SHORT, "framework": SYSTEM_PROMPT_FRAMEWORK}
+SYSTEM_PROMPT_TOS = """
+## Context
+You are an agent that is working with other agents. You are working together towards the same goal, but communication is limited.
+
+## How to decide what to do
+You will be presented with tasks, some of which may require multiple teammates simultaneously to work on.
+You and each of your teammates are a assigned a number, and each task is assigned a number as well.
+You are to work on these in the order they are presented. However, assume that your teammates deal with these tasks in order.
+For example, if you are Agent 3, and you are presented with 5 available slots for work, you are to take slot 3.
+This is because slots 0-2 will have already been claimed by Agents 0-2. Even if they show as empty in the prompt, assume that the change just isn't visible to you yet.
+
+## Reply format
+Reply with a single JSON object and nothing else:
+
+{
+    "thought": "Enter your reasoning here"
+    "message": "Enter a message here. Your teammates may or may not get it; communication is unreliable."
+    "action": "Your choice of action."
+}
+"""
+
+SYSTEM_PROMPTS = {"short": SYSTEM_PROMPT_SHORT, "framework": SYSTEM_PROMPT_FRAMEWORK, "tos": SYSTEM_PROMPT_TOS}
 
 
 # Tolerates raw newlines inside JSON strings (a failure the model produces now and then)
@@ -112,6 +136,8 @@ class Agent:
         self.distance_traveled = 0.0
         self.displayed_message = "Yet to act, no message for now."
         self.response_times = []
+        self.htn = HTNPlanner(HTN_TIME_BUDGET_SECONDS)  # this drone's own planner and clock
+        self.delegated = False
 
 
     def _create(self, messages):
@@ -210,7 +236,7 @@ class AgentHandler:
                     5. Complete the mission as quick as possible.
                     6. Pick ONE location to visit at a time. You have 3 available actions:
                             "IDLE": Do nothing.
-                            "FLY 0", "FLY 1", "FLY 2"...: Travel to the target with the given index.
+                            "FLY 0", "FLY 1", "FLY 2"...: Travel to the target with the given index. This is the TARGET index, not the SLOT index.
                             "RECALL": Go back to your starting location.
                     7. It takes multiple rounds for you to travel to a location. You may need to use the FLY action multiple times on the same target before you arrive. Do not assume a target has been visited until it has been cleared from the target list.
             """
@@ -315,7 +341,7 @@ class AgentHandler:
         print(f"Round {self.num_rounds}: prompting agents {to_prompt}")
 
         for idx in to_prompt:
-            self.parse_response(self.agents[idx].generate_response(self.generate_update_message(idx)), idx)
+            self.decide(idx)
 
         for idx in range(0, self.num_agents):
             if not self.agents[idx].inaction:
@@ -329,6 +355,37 @@ class AgentHandler:
         self.log_round()
         self.num_rounds += 1
         self.sim_end = time.perf_counter()
+
+    # Choose this drone's action: HTN plan if enabled and within budget, otherwise the LLM
+    def decide(self, agent_index: int):
+        agent = self.agents[agent_index]
+        update_message = self.generate_update_message(agent_index)  # always built and printed
+
+        if PLANNER_MODE == "htn_llm" and self.scenario == 1 and not agent.delegated:
+            try:
+                kind, target = agent.htn.plan(agent_index, self.num_agents,
+                                              self.environment.target_locations)
+                action = f"FLY {target}" if kind == "FLY" else kind
+                print(f"[HTN] drone {agent_index}: {action}")
+                reply = {"thought": "HTN plan",
+                         "message": f"Executing {action}.",
+                         "action": action}
+                # Record the exchange so the LLM has context if this drone is delegated later
+                if HISTORY_TURNS > 0:
+                    agent.recent += [
+                        {"role": "user", "content": update_message},
+                        {"role": "assistant", "content": json.dumps({"action": action,
+                                                                     "message": reply["message"]})},
+                    ]
+                    agent.recent = agent.recent[-2 * HISTORY_TURNS:]
+                self.parse_response(json.dumps(reply), agent_index)
+                return
+            except PlanningBudgetExceeded:
+                agent.delegated = True
+                print(f"[HTN] drone {agent_index}: planning budget spent, delegating to LLM")
+
+        self.parse_response(agent.generate_response(update_message), agent_index)
+
 
     # Interpret the response, search for which target the agent wants to head toward
     def parse_response(self, response: str, agent_index: int):
@@ -369,6 +426,7 @@ class AgentHandler:
             agent.displayed_message = data.get("message", "")
         else:
             agent.displayed_message = "Communication Failure."
+
 
     # Set velocity to go towards the target.
     def update_velocity(self, agent):
@@ -444,29 +502,24 @@ class AgentHandler:
                     else:
                         update_message += f"TEAMMATE {idx} SAYS: Out of communication range.\n\n"
 
-                all_targets_visited = True
-                for idx, target in enumerate(self.environment.target_locations):
-                    if target.visited == False:
-                        all_targets_visited = False
-                        break
+                all_targets_visited = all(t.visited for t in self.environment.target_locations)
                 if not all_targets_visited:
-                    pending_lines = []
+                    update_message += "\n"
+                    slot_number = 0  # continues across tasks, starting at 0
                     for idx, target in enumerate(self.environment.target_locations):
                         if target.visited:
                             continue
-                        # Sequential: a drone that already counted toward it isn't told it's unvisited
-                        if target.target_type == TargetType.SEQUENTIAL and agent_index in target.visitors:
-                            continue
-                        line = f"TARGET {idx}: {target.target_type.value}"
+                        update_message += f"TASK {idx}({target.target_type.value}): INCOMPLETE\n"
                         if SHOW_TARGET_COORDS:
                             distance = geo.point_distance(agent.location, target.get_location())
-                            line += f", X={target.north_m:.1f}m, Y={target.east_m:.1f}m, Total Distance: {distance:.0f} meters away."
-                        pending_lines.append(line + "\n")
-
-                    if pending_lines:
-                        update_message += "\nThe following targets have yet to be visited:\n" + "".join(pending_lines)
-                    else:
-                        update_message += "\nYou have already visited every remaining target. They are waiting on other drones.\n"
+                            update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "
+                                               f"{distance:.0f} meters away\n")
+                        claimants = [a.agent_index for a in self.agents
+                                     if a.last_target == idx and not a.inaction]
+                        for i in range(target.required_drones):
+                            holder = f"Agent {claimants[i]}" if i < len(claimants) else "Unclaimed"
+                            update_message += f"    Slot {slot_number}: {holder}\n"
+                            slot_number += 1
                 else:
                     update_message += (
                         "\nAll targets have been visited. The mission is not complete until every drone is back at "
@@ -490,6 +543,7 @@ class AgentHandler:
         return all(agent.inaction for agent in self.agents)
 
     def should_prompt(self, agent) -> bool:
+        return True
         """Decide whether this agent needs a new decision this round."""
         # Recalled/inactive agents are never prompted
         if agent.inaction or agent.target_index == "Home":
