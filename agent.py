@@ -6,7 +6,7 @@ import os
 import csv
 import random
 import time
-from htn_planner import HTNPlanner, PlanningBudgetExceeded
+from htn_planner import make_htn_planner, PlanningBudgetExceeded, PlanningFailed
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -20,8 +20,8 @@ LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
 LLM_MODEL = os.environ.get("MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 MAX_TOKENS = 1024
 TEMPERATURE = 0.0
-HTN_TIME_BUDGET_SECONDS = 0.5  # real-world seconds per drone, from its first HTN decision
-PLANNER_MODE = "llm"
+HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN decision
+PLANNER_MODE = "htn_llm" # "llm" or "htn_llm"
 
 # Past exchanges each agent remembers (0 = stateless).
 HISTORY_TURNS = 3
@@ -35,6 +35,14 @@ summary_log_path = os.path.join(LOG_DIR, "summary_log.csv")
 PROMPT_STYLE = "tos"        # "short": thought/message/action  |  "framework": state/role/task/plan/message/action
 SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
 SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
+
+# HTN backend (used when PLANNER_MODE == "htn_llm"):
+#   "rule"  deterministic role-assignment rules, no LLM calls
+#   "llm"   LLM-driven decomposition: candidates, selection, subtask expansion, re-planning
+HTN_BACKEND = "rule"
+HTN_MAX_DEPTH = 2        # LLM backend: levels of decomposition
+HTN_NUM_CANDIDATES = 2   # LLM backend: candidate decompositions per planning pass
+HTN_MAX_REPLANS = 2      # LLM backend: re-plan attempts before giving up
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -136,7 +144,11 @@ class Agent:
         self.distance_traveled = 0.0
         self.displayed_message = "Yet to act, no message for now."
         self.response_times = []
-        self.htn = HTNPlanner(HTN_TIME_BUDGET_SECONDS)  # this drone's own planner and clock
+
+        llm_options = dict(max_depth=HTN_MAX_DEPTH, num_candidates=HTN_NUM_CANDIDATES,
+                           max_replans=HTN_MAX_REPLANS) if HTN_BACKEND == "llm" else {}
+        self.htn = make_htn_planner(HTN_BACKEND, HTN_TIME_BUDGET_SECONDS, client, model, **llm_options)
+
         self.delegated = False
 
 
@@ -364,7 +376,8 @@ class AgentHandler:
         if PLANNER_MODE == "htn_llm" and self.scenario == 1 and not agent.delegated:
             try:
                 kind, target = agent.htn.plan(agent_index, self.num_agents,
-                                              self.environment.target_locations)
+                                              self.environment.target_locations,
+                                              update_message)
                 action = f"FLY {target}" if kind == "FLY" else kind
                 print(f"[HTN] drone {agent_index}: {action}")
                 reply = {"thought": "HTN plan",
@@ -380,9 +393,9 @@ class AgentHandler:
                     agent.recent = agent.recent[-2 * HISTORY_TURNS:]
                 self.parse_response(json.dumps(reply), agent_index)
                 return
-            except PlanningBudgetExceeded:
+            except (PlanningBudgetExceeded, PlanningFailed) as e:
                 agent.delegated = True
-                print(f"[HTN] drone {agent_index}: planning budget spent, delegating to LLM")
+                print(f"[HTN] drone {agent_index}: delegating to LLM ({e})")
 
         self.parse_response(agent.generate_response(update_message), agent_index)
 
@@ -508,18 +521,20 @@ class AgentHandler:
                     slot_number = 0  # continues across tasks, starting at 0
                     for idx, target in enumerate(self.environment.target_locations):
                         if target.visited:
-                            continue
-                        update_message += f"TASK {idx}({target.target_type.value}): INCOMPLETE\n"
-                        if SHOW_TARGET_COORDS:
-                            distance = geo.point_distance(agent.location, target.get_location())
-                            update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "
-                                               f"{distance:.0f} meters away\n")
-                        claimants = [a.agent_index for a in self.agents
-                                     if a.last_target == idx and not a.inaction]
-                        for i in range(target.required_drones):
-                            holder = f"Agent {claimants[i]}" if i < len(claimants) else "Unclaimed"
-                            update_message += f"    Slot {slot_number}: {holder}\n"
-                            slot_number += 1
+                            update_message += f"TASK {idx} COMPLETE\n"
+                        else:
+                            update_message += f"TASK {idx} ({target.target_type.value}): INCOMPLETE\n"
+                            if SHOW_TARGET_COORDS:
+                                distance = geo.point_distance(agent.location, target.get_location())
+                                update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "
+                                                  f"{distance:.0f} meters away\n")
+                            claimants = [a.agent_index for a in self.agents
+                                         if a.last_target == idx and not a.inaction]
+                            for i in range(target.required_drones):
+                                holder = f"Agent {claimants[i]}" if i < len(claimants) else "Unclaimed"
+                                update_message += f"    {holder}\n"
+                                #update_message += f"    Slot {self.number_to_letters(slot_number)}: {holder}\n"
+                                slot_number += 1
                 else:
                     update_message += (
                         "\nAll targets have been visited. The mission is not complete until every drone is back at "
@@ -529,6 +544,16 @@ class AgentHandler:
         print(update_message)
         print("End AI prompt\n")
         return update_message
+
+    def number_to_letters(self, n: int) -> str:
+        if n < 0:
+            raise ValueError("n must be non-negative")
+        result = ""
+        n += 1  # shift to 1-indexed for bijective base-26
+        while n > 0:
+            n, remainder = divmod(n - 1, 26)
+            result = chr(ord('A') + remainder) + result
+        return result
 
 
     # Return an array of arrays, representing the location of all agents.
