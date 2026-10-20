@@ -6,7 +6,7 @@ import os
 import csv
 import random
 import time
-from htn_planner import make_htn_planner, PlanningBudgetExceeded, PlanningFailed
+from htn_planner import RulePlanner, RuleHTNPlanner
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -20,8 +20,6 @@ LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
 LLM_MODEL = os.environ.get("MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 MAX_TOKENS = 1024
 TEMPERATURE = 0.0
-HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN decision
-PLANNER_MODE = "htn_llm" # "llm" or "htn_llm"
 
 # Past exchanges each agent remembers (0 = stateless).
 HISTORY_TURNS = 3
@@ -36,13 +34,12 @@ PROMPT_STYLE = "tos"        # "short": thought/message/action  |  "framework": s
 SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
 SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
 
-# HTN backend (used when PLANNER_MODE == "htn_llm"):
-#   "rule"  deterministic role-assignment rules, no LLM calls
-#   "llm"   LLM-driven decomposition: candidates, selection, subtask expansion, re-planning
+# Planner backend (used when PLANNER_MODE == "htn"):
+#   "rule"  deterministic role-assignment rules
+#   "htn_llm"   determinisitic HTN planning, creating an Area hierarchy. Will delegate to LLM if it takes too long.
+PLANNER_MODE = "htn_llm"
+HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN decision
 HTN_BACKEND = "rule"
-HTN_MAX_DEPTH = 2        # LLM backend: levels of decomposition
-HTN_NUM_CANDIDATES = 2   # LLM backend: candidate decompositions per planning pass
-HTN_MAX_REPLANS = 2      # LLM backend: re-plan attempts before giving up
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -147,8 +144,8 @@ class Agent:
 
         llm_options = dict(max_depth=HTN_MAX_DEPTH, num_candidates=HTN_NUM_CANDIDATES,
                            max_replans=HTN_MAX_REPLANS) if HTN_BACKEND == "llm" else {}
-        self.htn = make_htn_planner(HTN_BACKEND, HTN_TIME_BUDGET_SECONDS, client, model, **llm_options)
 
+        self.htn = RulePlanner(HTN_TIME_BUDGET_SECONDS)
         self.delegated = False
 
 
