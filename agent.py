@@ -1,12 +1,13 @@
 from environment import Environment, TargetType, VISIT_RADIUS_METERS
 import json
 import utils_geometry as geo
-from openai import OpenAI, BadRequestError
+from openai import OpenAI, BadRequestError, APITimeoutError
 import os
 import csv
 import random
 import time
-from htn_planner import RulePlanner, RuleHTNPlanner
+from htn_planner import RulePlanner, RuleHTNPlanner, PlanningBudgetExceeded, PlanningFailed
+import statistics
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -17,7 +18,9 @@ from htn_planner import RulePlanner, RuleHTNPlanner
 #   export MODEL=nvidia/nemotron-3-ultra-550b-a55b      (optional; this is the default)
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
 LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
-LLM_MODEL = os.environ.get("MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+LLM_MODEL = os.environ.get("MODEL", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16")
+LLM_TIME_LIMIT_SECONDS = 10
+LLM_REMEMBER_REASONING = True
 MAX_TOKENS = 1024
 TEMPERATURE = 0.0
 
@@ -29,15 +32,16 @@ LOG_DIR = os.environ.get("LOG_DIR", ".")
 log_path = os.path.join(LOG_DIR, "log.csv")
 summary_log_path = os.path.join(LOG_DIR, "summary_log.csv")
 
-# --- Experiment switches (the two copies disagreed; defaults follow the local copy) ---
-PROMPT_STYLE = "tos"        # "short": thought/message/action  |  "framework": state/role/task/plan/message/action
+# --- Experiment configs
+PROMPT_STYLE = "short"        # "short": thought/message/action  |  "framework": state/role/task/plan/message/action
 SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
 SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
 
 # Planner backend (used when PLANNER_MODE == "htn"):
 #   "rule"  deterministic role-assignment rules
 #   "htn_llm"   determinisitic HTN planning, creating an Area hierarchy. Will delegate to LLM if it takes too long.
-PLANNER_MODE = "htn_llm"
+#   "llm" llm only, no deterministic planning.
+PLANNER_MODE = "llm"
 HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN decision
 HTN_BACKEND = "rule"
 
@@ -50,7 +54,7 @@ Your JSON must have "thought", "message", and "action" components.
 You can communicate to your teammates through "message", but they may or may not receive it.
 In the thought section of the JSON, output the ideal actions for the group as a whole to take, not just yourself.
 
-Example VALID output: {"thought": "Teammate 3 is already going to target 4, so I will go to target 2. Teammate 1 is currently idle, and it would be more helpful if they went to help Teammate 4 take care of Target 9.", "message": "I will go to target 2, nobody else needs to go there.", "action": "FLY 2"}
+Example VALID output: {"message": "I will go to target 2, nobody else needs to go there.", "action": "FLY 2"}
 Example INVALID output: {"thought": {"reason": "Target 4 is busy", "goal": "Visit all targets"}, "action": {"FLY": 2}}
 """
 
@@ -95,8 +99,8 @@ This is because slots 0-2 will have already been claimed by Agents 0-2. Even if 
 Reply with a single JSON object and nothing else:
 
 {
-    "thought": "Enter your reasoning here"
-    "message": "Enter a message here. Your teammates may or may not get it; communication is unreliable."
+    "thought": "Enter your reasoning here",
+    "message": "Enter a message here. Your teammates may or may not get it; communication is unreliable.",
     "action": "Your choice of action."
 }
 """
@@ -121,6 +125,12 @@ def extract_json_object(text):
         if isinstance(obj, dict) and "action" in obj:
             return obj
     return None
+
+def split_reasoning(reasoning, content):
+    if not reasoning and "</think>" in content:
+        reasoning, content = content.split("</think>", 1)
+        reasoning = reasoning.replace("<think>", "")
+    return reasoning.strip(), content.strip()
 
 
 # Handles LLM calls & message history
@@ -148,43 +158,101 @@ class Agent:
         self.htn = RulePlanner(HTN_TIME_BUDGET_SECONDS)
         self.delegated = False
 
-
     def _create(self, messages):
-        return self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
-            # Different Nemotron chat templates use different flag names; each ignores the other's.
-            extra_body={"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
-        )
+        t0 = time.perf_counter()
+        reasoning, content = [], []
+        t_first = t_reason_end = None
+        finish = usage = stream = None
+        timed_out = False
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model, messages=messages,
+                max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
+                stream=True,
+                stream_options={"include_usage": True},
+                timeout=LLM_TIME_LIMIT_SECONDS,
+            )
+            for chunk in stream:
+                now = time.perf_counter()
+                if now - t0 > LLM_TIME_LIMIT_SECONDS:
+                    timed_out = True
+                    break
+                if chunk.usage:
+                    usage = chunk.usage
+                if not chunk.choices:
+                    continue
+                ch = chunk.choices[0]
+                d = ch.delta
+                finish = ch.finish_reason or finish
+                r = getattr(d, "reasoning_content", None) or getattr(d, "reasoning", None)
+                if r:
+                    t_first = t_first or now
+                    reasoning.append(r)
+                    t_reason_end = now
+                if d.content:
+                    t_first = t_first or now
+                    content.append(d.content)
+                    if t_reason_end is None and "</think>" in "".join(content):
+                        t_reason_end = now
+        except APITimeoutError:
+            timed_out = True
+        finally:
+            if stream is not None:
+                stream.close()
+        t_end = time.perf_counter()
+
+        t_first = t_first or t_end
+        answer_start = t_reason_end or t_first
+        self.last_stats = {
+            "ttft": t_first - t0,
+            "reasoning_s": (t_reason_end - t_first) if t_reason_end else 0.0,
+            "answer_s": t_end - answer_start,
+            "total_s": t_end - t0,
+            "prompt_tokens": usage.prompt_tokens if usage else None,
+            "completion_tokens": usage.completion_tokens if usage else None,
+            "finish_reason": finish,
+            "timed_out": timed_out,
+        }
+        return "".join(reasoning), "".join(content)
 
     def generate_response(self, message):
         messages = self.history + self.recent + [{"role": "user", "content": message}]
         started = time.perf_counter()
         try:
-            response = self._create(messages)
+            reasoning, content = self._create(messages)
         except BadRequestError as e:
-            # Context overflow: forget remembered turns and retry once
             if "context length" in str(e).lower() and self.recent:
                 self.recent = []
-                response = self._create(self.history + [{"role": "user", "content": message}])
+                reasoning, content = self._create(self.history + [{"role": "user", "content": message}])
             else:
                 raise
         self.response_times.append(time.perf_counter() - started)
-        content = response.choices[0].message.content
 
+        if self.last_stats["timed_out"]:
+            self.last_stats["invalid_json"] = False  # timeouts are counted separately
+            self.call_stats.append(self.last_stats)
+            print(f"WARNING: agent {self.agent_index} exceeded {LLM_TIME_LIMIT_SECONDS}s; keeping previous course.")
+            return None
+
+        reasoning, content = split_reasoning(reasoning, content)
         parsed = extract_json_object(content)
+        self.last_stats["invalid_json"] = parsed is None
+        self.call_stats.append(self.last_stats)
+
         if parsed is not None and HISTORY_TURNS > 0:
+            reply = json.dumps({
+                "action": parsed.get("action", ""),
+                "message": parsed.get("message", ""),
+            })
+            if KEEP_REASONING_IN_HISTORY and reasoning:
+                reply = f"<think>\n{reasoning}\n</think>\n{reply}"
             self.recent += [
                 {"role": "user", "content": message},
-                {"role": "assistant", "content": json.dumps({
-                    "action": parsed.get("action", ""),
-                    "message": parsed.get("message", ""),
-                })},
+                {"role": "assistant", "content": reply},
             ]
             self.recent = self.recent[-2 * HISTORY_TURNS:]
-        return content
+        return f"<think>{reasoning}</think>{content}" if reasoning else content
 
     # Advance position according to velocity
     def step(self):
@@ -285,9 +353,43 @@ class AgentHandler:
         return sum(times) / len(times) if times else None
 
     def log_summary(self, success: bool, optimal=None):
+        # total_distance_traveled: Collective distance traveled by all drones
+        # revisit_rate: The rate at which drones visited targets they did not need to (rough approximation of poor division of labor)
+        # success: Whether or not the simulation succeeded
+        # num_rounds: The number of rounds the simulation took to run (Most important for measuring agent problem solving ability)
+        # comms_quality: The chance for communications within range to succeed (0-1)
+        # sim_time_seconds: The total time the simulation ran, in seconds
+        # avg_ttft: Average time-to-first-token for each AI call.
+        # std_ttft: Std deviation of times-to-first-token.
+        # avg_reasoning_s: Average time spent reasoning for each AI call.
+        # std_reasoning_s: Std deviation of reasoning time.
+        # avg_answer_s: Average time spent answering for each AI call.
+        # std_answer_s: Std deviation of answer time.
+        # avg_completion_tokens: Average tokens used for each AI call.
+        # std_completion_tokens: Std deviation of completion tokens.
+        # optimal_distance: Estimated optimal solution (system is not gaurenteed to find best possible solution)
+        # optimal_rounds: The number of rounds the estimated optimal solution took to finish.
+        # prompt_style: the prompt style used.
+        # planning_style: the planning style used.
+        # num_agents: the number of agents in the simulation
+        # num_exclusive: The number of exclusive targets.
+        # num_joint: The number of joint targets.
+        # num_sequential: The number of sequential targets.
+        # area_size: Radius of the simulation area, in meters.
+        # agent_speed: The maximum distance an agent can move in a round, in meters.
+        # num_llm_calls: The number of times an agent was prompted
+        # timeout_rate: The frequency that a model timed out.
+        # invalid_json_rate: The frequency that a model output in an invalid format
         header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality",
-                  "sim_time_seconds", "avg_response_seconds", "optimal_distance", "optimal_rounds"]
+          "sim_time_seconds", "avg_ttft", "std_ttft", "avg_reasoning_s", "std_reasoning_s",
+          "avg_answer_s", "std_answer_s", "avg_completion_tokens", "std_completion_tokens", "optimal_distance",
+          "optimal_rounds", "prompt style", "planning style", "num_agents", "num_exclusive", "num_joint", "num_sequential", "area_size", "agent_speed",
+          "num_llm_calls", "timeout_rate", "invalid_json_rate"]
+        
         avg_response = self.get_average_response_time()
+        
+
+        target_types = self.environment.get_target_amounts()
         row = [
             f"{self.get_total_distance_traveled():.2f}",
             f"{self.get_revisit_rate():.4f}",
@@ -295,10 +397,29 @@ class AgentHandler:
             self.num_rounds,
             self.comms_quality,
             f"{self.get_sim_time():.2f}",
-            "" if avg_response is None else f"{avg_response:.3f}",
+            self._avg_stat("ttft"),
+            self._std_stat("ttft"),
+            self._avg_stat("reasoning_s"),
+            self._std_stat("reasoning_s"),
+            self._avg_stat("answer_s"),
+            self._std_stat("answer_s"),
+            self._avg_stat("completion_tokens"),
+            self._std_stat("completion_tokens"),
             "" if optimal is None else f"{optimal.distance:.2f}",
             "" if optimal is None else optimal.rounds,
+            PROMPT_STYLE,
+            PLANNER_MODE,
+            self.num_agents,
+            target_types[0],
+            target_types[1],
+            target_types[2],
+            environement.area_size_m,
+            self.drone_velocity,
+            self._num_calls(),
+            self._rate_stat("timed_out"),
+            self._rate_stat("invalid_json")
         ]
+
         os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)
 
         # Columns changed since the last run? Keep the old file rather than mixing layouts.
@@ -515,23 +636,39 @@ class AgentHandler:
                 all_targets_visited = all(t.visited for t in self.environment.target_locations)
                 if not all_targets_visited:
                     update_message += "\n"
-                    slot_number = 0  # continues across tasks, starting at 0
-                    for idx, target in enumerate(self.environment.target_locations):
-                        if target.visited:
-                            update_message += f"TASK {idx} COMPLETE\n"
-                        else:
-                            update_message += f"TASK {idx} ({target.target_type.value}): INCOMPLETE\n"
-                            if SHOW_TARGET_COORDS:
-                                distance = geo.point_distance(agent.location, target.get_location())
-                                update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "
-                                                  f"{distance:.0f} meters away\n")
-                            claimants = [a.agent_index for a in self.agents
-                                         if a.last_target == idx and not a.inaction]
-                            for i in range(target.required_drones):
-                                holder = f"Agent {claimants[i]}" if i < len(claimants) else "Unclaimed"
-                                update_message += f"    {holder}\n"
-                                #update_message += f"    Slot {self.number_to_letters(slot_number)}: {holder}\n"
-                                slot_number += 1
+
+                    # Theory of Scene would encourage a specific format
+                    if PROMPT_STYLE == "tos":
+                        slot_number = 0  # continues across tasks, starting at 0
+                        for idx, target in enumerate(self.environment.target_locations):
+                            if target.visited:
+                                update_message += f"TASK {idx} COMPLETE\n"
+                            else:
+                                update_message += f"TASK {idx} ({target.target_type.value}): INCOMPLETE\n"
+                                if SHOW_TARGET_COORDS:
+                                    distance = geo.point_distance(agent.location, target.get_location())
+                                    update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "
+                                                      f"{distance:.0f} meters away\n")
+                                claimants = [a.agent_index for a in self.agents
+                                             if a.last_target == idx and not a.inaction]
+                                for i in range(target.required_drones):
+                                    holder = f"Agent {claimants[i]}" if i < len(claimants) else "Unclaimed"
+                                    update_message += f"    {holder}\n"
+                                    #update_message += f"    Slot {self.number_to_letters(slot_number)}: {holder}\n"
+                                    slot_number += 1
+
+                    # If Theory of Scene is not being used, use a more generic format
+                    else:
+                        for idx, target in enumerate(self.environment.target_locations):
+                            if target.visited:
+                                update_message += f"TASK {idx} COMPLETE\n"
+                            else:
+                                update_message += f"TASK {idx} (target.target_type.value}): INCOMPLETE\n"
+                                if SHOW_TARGET_COORDS:
+                                    distance = geo.point_distance(agent.location, target.get_location())
+                                    update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "
+                                                       f"{distance:.0f} meters away\n")
+
                 else:
                     update_message += (
                         "\nAll targets have been visited. The mission is not complete until every drone is back at "
@@ -608,3 +745,21 @@ class AgentHandler:
         target_location = target.get_location()
         rivals.sort(key=lambda a: (geo.point_distance(a.location, target_location), a.agent_index))
         return agent not in rivals[:slots]
+
+    def _avg_stat(self, key):
+        vals = [s[key] for a in self.agents for s in a.call_stats if s.get(key) is not None]
+        return "" if not vals else f"{sum(vals)/len(vals):.3f}"
+
+    def _std_stat(self, key):
+        vals = [s[key] for a in self.agents for s in a.call_stats if s.get(key) is not None]
+        return "" if len(vals) < 2 else f"{statistics.stdev(vals):.3f}"
+
+    def _num_calls(self):
+        return sum(len(a.call_stats) for a in self.agents)
+
+    def _rate_stat(self, key):
+        total = self._num_calls()
+        if total == 0:
+            return ""
+        count = sum(1 for a in self.agents for s in a.call_stats if s.get(key))
+        return f"{count / total:.4f}"

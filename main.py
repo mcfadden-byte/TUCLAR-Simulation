@@ -184,7 +184,7 @@ def agent_worker(sim, response_queue):
 
 
 if __name__ == "__main__":
-    for i in range(0,1):
+    for i in range(0,2):
         # Metrics we'll use to measure the quality of success
         num_rounds: int
         num_visits: int

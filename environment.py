@@ -85,11 +85,10 @@ class Environment:
             case 0: # Scenario 0: One target, random location
                 self.target_locations.append(TargetLocation(random.uniform(-area_size_m, area_size_m), random.uniform(-area_size_m, area_size_m)))
             case 1:
-                #TODO Replace with forest spots?
                 self._spawn_targets({
-                    TargetType.EXCLUSIVE: 3,
-                    TargetType.JOINT: 2,
-                    TargetType.SEQUENTIAL: 2,
+                    TargetType.EXCLUSIVE: random.randint(2, 5),
+                    TargetType.JOINT: random.randint(1, 4),
+                    TargetType.SEQUENTIAL: random.randint(2, 4),
                 })
 
     # Load map data. Just loads buildings for now.
@@ -137,4 +136,15 @@ class Environment:
                 self.target_locations.append(
                     TargetLocation(random.uniform(-half, half), random.uniform(-half, half), target_type=target_type)
                 )
-        random.shuffle(self.target_locations)  # so target index doesn't reveal type
+        random.shuffle(self.target_locations)
+
+    def get_target_amounts(self):
+        result = [0, 0, 0]
+        for target in self.target_locations:
+            match target.TargetType:
+                case TargetType.EXCLUSIVE: result[0] += 1
+                case TargetType.JOINT: result[1] += 1
+                case TargetType.SEQUENTIAL: result[2] += 2
+
+        return result
+
