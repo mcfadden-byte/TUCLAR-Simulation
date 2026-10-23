@@ -13,3 +13,4 @@ Shapely==2.1.2
 xarray==2026.7.0
 openai==3.14.1
 pymap3d
+httpx

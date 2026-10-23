@@ -8,6 +8,7 @@ import random
 import time
 from htn_planner import RulePlanner, RuleHTNPlanner, PlanningBudgetExceeded, PlanningFailed
 import statistics
+import httpx
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -151,6 +152,9 @@ class Agent:
         self.distance_traveled = 0.0
         self.displayed_message = "Yet to act, no message for now."
         self.response_times = []
+        self.last_stats = []
+        self.call_stats = []
+
 
         llm_options = dict(max_depth=HTN_MAX_DEPTH, num_candidates=HTN_NUM_CANDIDATES,
                            max_replans=HTN_MAX_REPLANS) if HTN_BACKEND == "llm" else {}
@@ -245,7 +249,7 @@ class Agent:
                 "action": parsed.get("action", ""),
                 "message": parsed.get("message", ""),
             })
-            if KEEP_REASONING_IN_HISTORY and reasoning:
+            if LLM_REMEMBER_REASONING and reasoning:
                 reply = f"<think>\n{reasoning}\n</think>\n{reply}"
             self.recent += [
                 {"role": "user", "content": message},
@@ -413,7 +417,7 @@ class AgentHandler:
             target_types[0],
             target_types[1],
             target_types[2],
-            environement.area_size_m,
+            self.environment.area_size_m,
             self.drone_velocity,
             self._num_calls(),
             self._rate_stat("timed_out"),
@@ -663,7 +667,7 @@ class AgentHandler:
                             if target.visited:
                                 update_message += f"TASK {idx} COMPLETE\n"
                             else:
-                                update_message += f"TASK {idx} (target.target_type.value}): INCOMPLETE\n"
+                                update_message += f"TASK {idx} ({target.target_type.value}): INCOMPLETE\n"
                                 if SHOW_TARGET_COORDS:
                                     distance = geo.point_distance(agent.location, target.get_location())
                                     update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "

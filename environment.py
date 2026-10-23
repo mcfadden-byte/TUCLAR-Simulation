@@ -141,7 +141,7 @@ class Environment:
     def get_target_amounts(self):
         result = [0, 0, 0]
         for target in self.target_locations:
-            match target.TargetType:
+            match target.target_type:
                 case TargetType.EXCLUSIVE: result[0] += 1
                 case TargetType.JOINT: result[1] += 1
                 case TargetType.SEQUENTIAL: result[2] += 2
