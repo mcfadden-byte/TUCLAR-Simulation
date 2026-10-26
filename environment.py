@@ -144,7 +144,7 @@ class Environment:
             match target.target_type:
                 case TargetType.EXCLUSIVE: result[0] += 1
                 case TargetType.JOINT: result[1] += 1
-                case TargetType.SEQUENTIAL: result[2] += 2
+                case TargetType.SEQUENTIAL: result[2] += 1
 
         return result
 

@@ -52,7 +52,7 @@ class Simulation:
         match self.scenario:
             case 0: num_agents = 1
             case 1: num_agents = 5
-        self.handler = AgentHandler(num_agents, self.scenario, self.environment, 0.0, 1000)
+        self.handler = AgentHandler(num_agents, self.scenario, self.environment, 0.5, 1000)
         return True
 
 
