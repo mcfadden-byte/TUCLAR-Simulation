@@ -52,7 +52,8 @@ class Simulation:
         match self.scenario:
             case 0: num_agents = 1
             case 1: num_agents = 5
-        self.handler = AgentHandler(num_agents, self.scenario, self.environment)
+        self.handler = AgentHandler(num_agents, self.scenario, self.environment, 0.0, 1000)
+        return True
 
 
     # TODO: Expand as the scenarios get more complicated
@@ -84,7 +85,7 @@ class Simulation:
 
     # If all agents decided to go home and do nothing before the mission was complete, the mission is a failure.
     def check_failure(self):
-        if self.handler.num_rounds > 100:
+        if self.handler.num_rounds > 500:
             print("TIMEOUT: Simulation has been going on too long. Cutting it off and moving on.")
             return True
         match self.scenario:
@@ -184,7 +185,7 @@ def agent_worker(sim, response_queue):
 
 
 if __name__ == "__main__":
-    for i in range(0,2):
+    for i in range(0,10):
         # Metrics we'll use to measure the quality of success
         num_rounds: int
         num_visits: int

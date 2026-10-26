@@ -20,9 +20,10 @@ import httpx
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
 LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
 LLM_MODEL = os.environ.get("MODEL", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16")
-LLM_TIME_LIMIT_SECONDS = 10
+LLM_TIME_LIMIT_SECONDS = 30
+LLM_ENABLE_REASONING = True
 LLM_REMEMBER_REASONING = True
-MAX_TOKENS = 1024
+MAX_TOKENS = 32000
 TEMPERATURE = 0.0
 
 # Past exchanges each agent remembers (0 = stateless).
@@ -34,7 +35,7 @@ log_path = os.path.join(LOG_DIR, "log.csv")
 summary_log_path = os.path.join(LOG_DIR, "summary_log.csv")
 
 # --- Experiment configs
-PROMPT_STYLE = "short"        # "short": thought/message/action  |  "framework": state/role/task/plan/message/action
+PROMPT_STYLE = "short"        # "short": message/action  |  "framework": state/role/task/plan/message/action
 SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
 SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
 
@@ -51,12 +52,8 @@ HTN_BACKEND = "rule"
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT_SHORT = """
 Your output must be in valid JSON format. Do not output anything else.
-Your JSON must have "thought", "message", and "action" components.
+Your JSON must have "message", and "action" components.
 You can communicate to your teammates through "message", but they may or may not receive it.
-In the thought section of the JSON, output the ideal actions for the group as a whole to take, not just yourself.
-
-Example VALID output: {"message": "I will go to target 2, nobody else needs to go there.", "action": "FLY 2"}
-Example INVALID output: {"thought": {"reason": "Target 4 is busy", "goal": "Visit all targets"}, "action": {"FLY": 2}}
 """
 
 SYSTEM_PROMPT_FRAMEWORK = """
@@ -172,7 +169,7 @@ class Agent:
             stream = self.client.chat.completions.create(
                 model=self.model, messages=messages,
                 max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
+                extra_body={"chat_template_kwargs": {"enable_thinking": LLM_ENABLE_REASONING, "thinking": LLM_ENABLE_REASONING}},
                 stream=True,
                 stream_options={"include_usage": True},
                 timeout=LLM_TIME_LIMIT_SECONDS,
@@ -285,14 +282,14 @@ class Agent:
 class AgentHandler:
 
     # Initiates the AI, creates the system prompts, initializes variables
-    def __init__(self, num_agents: int, scenario: int, environment: Environment):
+    def __init__(self, num_agents: int, scenario: int, environment: Environment, comms_quality: float = 0.5, comms_distance: int = 1000):
         self.client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
         self.model = LLM_MODEL
 
         self.scenario = scenario
         self.environment = environment
         self.num_rounds = 0
-        self.comms_quality = 0.5 #Set to 1 for perfect comms
+        self.comms_quality = 0.0 #Set to 1 for perfect comms
         self.comms_distance = 1000 #Set to -1 for infinite range
         self.drone_velocity = 100
         self.sim_start = None
@@ -311,7 +308,7 @@ class AgentHandler:
             1: """
                 MISSION REQUIREMENTS:
                     1. There is a series of locations that you will be given.
-                    2. You will have a series of teammates. You know where they are going, but you cannot communicate with them. All your teammates reason exactly the same as you.
+                    2. You will have a series of teammates. All your teammates reason exactly the same as you.
                     3. The mission is a success once all target locations are cleared, and you have used the RECALL action to go back to start.
                     4. There are three types of target location: Sequential, which must be visited by three different agents at any point (you do not need to all visit at the same time). Joint, which must be visited by two different agents at the *same time*. And Exclusive, which must be visited by any agent.
                     5. Complete the mission as quick as possible.
@@ -320,6 +317,8 @@ class AgentHandler:
                             "FLY 0", "FLY 1", "FLY 2"...: Travel to the target with the given index. This is the TARGET index, not the SLOT index.
                             "RECALL": Go back to your starting location.
                     7. It takes multiple rounds for you to travel to a location. You may need to use the FLY action multiple times on the same target before you arrive. Do not assume a target has been visited until it has been cleared from the target list.
+
+                    Example JSON output: {"message": "communicate with your teammates here", "action": "Enter your action here"}
             """
         }
 
@@ -342,8 +341,8 @@ class AgentHandler:
         targets = self.environment.target_locations
         if not targets:
             return 0.0
-        revisited = sum(1 for t in targets if len(t.visitors) > 1)
-        return revisited / len(targets)
+        wasted_visits = sum(len(t.visitors) - t.required_drones for t in targets if len(t.visitors) > t.required_drones)
+        return wasted_visits / sum(t.required_drones for t in targets)
 
     def get_sim_time(self):
         """Seconds from the start of the first round to the end of the last one."""
@@ -613,7 +612,8 @@ class AgentHandler:
                 )
             case 1:
                 mates = ", ".join(str(j) for j in range(self.num_agents) if j != agent_index)
-                update_message += f"You are **agent {agent_index}**; your teammates are agents {mates}.\n"
+                if True:#PROMPT_STYLE == "tos": TODO: The agents will sometimes waste tokens trying to find out what their agent number is, maybe this will fix it
+                    update_message += f"You are **agent {agent_index}**; your teammates are agents {mates}.\n"
                 if SHOW_OWN_LOCATION:
                     update_message += f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
 
@@ -632,10 +632,11 @@ class AgentHandler:
                         teammate_target = f"{mate_target.target_type.value} {teammate.last_target}"
                     update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
                     
-                    if self.comms_distance == -1 or geo.geometric_mean_3d(teammate_location[0], teammate_location[1], teammate_location[2], agent.location[0], agent.location[1], agent.location[2]) <= self.comms_distance:
-                        update_message += f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n"
-                    else:
-                        update_message += f"TEAMMATE {idx} SAYS: Out of communication range.\n\n"
+                    if self.comms_quality > 0.0:
+                        if self.comms_distance == -1 or geo.geometric_mean_3d(teammate_location[0], teammate_location[1], teammate_location[2], agent.location[0], agent.location[1], agent.location[2]) <= self.comms_distance:
+                            update_message += f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n"
+                        else:
+                            update_message += f"TEAMMATE {idx} SAYS: Out of communication range.\n\n"
 
                 all_targets_visited = all(t.visited for t in self.environment.target_locations)
                 if not all_targets_visited:
@@ -646,7 +647,8 @@ class AgentHandler:
                         slot_number = 0  # continues across tasks, starting at 0
                         for idx, target in enumerate(self.environment.target_locations):
                             if target.visited:
-                                update_message += f"TASK {idx} COMPLETE\n"
+                               # update_message += f"TASK {idx} COMPLETE\n"
+                               pass
                             else:
                                 update_message += f"TASK {idx} ({target.target_type.value}): INCOMPLETE\n"
                                 if SHOW_TARGET_COORDS:
@@ -663,11 +665,14 @@ class AgentHandler:
 
                     # If Theory of Scene is not being used, use a more generic format
                     else:
+                        update_message += f"The following targets have yet to be visited:\n"
                         for idx, target in enumerate(self.environment.target_locations):
                             if target.visited:
-                                update_message += f"TASK {idx} COMPLETE\n"
-                            else:
-                                update_message += f"TASK {idx} ({target.target_type.value}): INCOMPLETE\n"
+                                pass
+                                #update_message += f"Target {idx} has been cleared, choose another target.\n"
+
+                            elif not (target.target_type == TargetType.SEQUENTIAL and agent_index in target.visitors):
+                                update_message += f"Target {idx} ({target.target_type.value}): INCOMPLETE\n"
                                 if SHOW_TARGET_COORDS:
                                     distance = geo.point_distance(agent.location, target.get_location())
                                     update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "
@@ -706,7 +711,6 @@ class AgentHandler:
         return all(agent.inaction for agent in self.agents)
 
     def should_prompt(self, agent) -> bool:
-        return True
         """Decide whether this agent needs a new decision this round."""
         # Recalled/inactive agents are never prompted
         if agent.inaction or agent.target_index == "Home":
