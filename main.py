@@ -1,7 +1,5 @@
 import warnings
 warnings.filterwarnings('ignore')
-
-
 import matplotlib.pyplot as plt
 import contextily as ctx
 import pymap3d as pm
@@ -14,14 +12,22 @@ import threading
 import queue
 import os
 import find_optimal
+import rule_baseline
 
 from environment import Environment
 
 HEADLESS = not os.environ.get("DISPLAY")
 
+"""
+Simulation: The class that initiates the AgentHandler and the Environment. It is responsible for checking when
+            the simulation has succeeded or failed, and handles the visual plot, if there is a display.
+
+Currently, you may see references to a "scenario" parameter. This parameter, as implemented right now,
+is almost always meant to be 1. The code and research has overwhelmingly been built around scenario 1, 
+the only other scenario that exists right now is 0, which was implemented as a test scenario and not
+intended to test any of the things this research is intended to test.
+"""
 class Simulation:
-
-
 
     def __init__(self, scenario: int, center_lat: float, center_lon: float, area_size_m: float = 1000):
         self.scenario = scenario
@@ -42,11 +48,9 @@ class Simulation:
         self.target_point = None
 
 
-    # TODO: Expand as the scenarios get more complicated
     def init_scenario(self):
         self.environment = Environment(self.scenario, self.center_lat, self.center_lon, self.area_size_m)
 
-    # TODO: Expand as the scenarios get more complicated
     def init_handler(self):
         num_agents: int
         match self.scenario:
@@ -56,7 +60,6 @@ class Simulation:
         return True
 
 
-    # TODO: Expand as the scenarios get more complicated
     def check_success(self):
         match self.scenario:
             case 0:
@@ -196,6 +199,7 @@ if __name__ == "__main__":
         sim.init_handler()
         sim.show_map()
         optimal = sim.find_optimal()
+        rule = rule_baseline.evaluate(sim.environment, num_agents, handler.drone_velocity, comms_quality=handler.comms_quality, comms_distance=handler.comms_distance)
 
         response_queue = queue.Queue()
         worker = threading.Thread(target=agent_worker, args=(sim, response_queue), daemon=True)
@@ -220,7 +224,7 @@ if __name__ == "__main__":
             plt.close(sim.fig)
 
         success = sim.check_success()
-        sim.handler.log_summary(success, optimal)
+        sim.handler.log_summary(success, optimal, rule)
         print(f"Finished round {i}, Total rounds: {sim.handler.num_rounds}")
 
         if sim.window_closed:

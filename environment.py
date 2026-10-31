@@ -5,6 +5,11 @@ import random
 import utils_geometry as geo
 from enum import Enum
 
+"""
+Exclusive: only one drone needs to visit the location for it to be considered cleared.
+Joint: two drones need to visit at the same time for the target to be considered cleared.
+Sequential: three drones need to visit the target, concurrency doesn't matter.
+"""
 class TargetType(Enum):
     EXCLUSIVE = "Exclusive"
     JOINT = "Joint"
@@ -19,6 +24,10 @@ REQUIRED_DRONES = {
 
 
 VISIT_RADIUS_METERS = 100 #TODO: Adjust as appropriate
+
+"""
+TargetLocation: data associated with a target location that the drones must visit.
+"""
 
 class TargetLocation:
 
@@ -61,7 +70,7 @@ class TargetLocation:
                 self.cleared = len(self.visitors) >= 3        # cumulative, distinct drones
 
     def slots_remaining(self):
-        """How many more drones this target can usefully absorb."""
+        """How many more drones this target can usefully be visited by."""
         if self.cleared:
             return 0
         if self.target_type == TargetType.SEQUENTIAL:
@@ -123,12 +132,14 @@ class Environment:
                 return True
         return False
 
+    # Return an array with the [x, y, z] locations of each target
     def get_target_locations(self):
         result = []
         for target in self.target_locations:
             result.append(target.get_location())
         return result
 
+    # Spawn the given targets within the simulation area
     def _spawn_targets(self, counts: dict):
         half = self.area_size_m / 2
         for target_type, count in counts.items():
@@ -138,6 +149,7 @@ class Environment:
                 )
         random.shuffle(self.target_locations)
 
+    # Return a 3-length array describing the number of targets in the simulation
     def get_target_amounts(self):
         result = [0, 0, 0]
         for target in self.target_locations:

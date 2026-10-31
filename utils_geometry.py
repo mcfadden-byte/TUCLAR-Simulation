@@ -1,5 +1,10 @@
 import math
 
+"""
+Various geometric math functions, mostly for converting between lat/lon/alt to x/y/z
+"""
+
+
 EARTH_RADIUS_M = 6371000  # Earth's mean radius in meters
 
 def degrees_to_meters(lat1: float, lon1: float, alt1: float, lat2: float, lon2: float, alt2: float) -> float:

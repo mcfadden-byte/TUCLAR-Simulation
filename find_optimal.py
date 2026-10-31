@@ -34,10 +34,12 @@ class OptimalSolution:
     rounds: int          # fewest rounds taken by any successful run (may come from a different run)
     iterations: int      # runs actually executed
     successes: int       # runs that finished the mission
+    avg_distance: float  # average distance flown across all random trials
+    avg_rounds: float    # average number of rounds required to finish across all random trials
 
 
 def solve(environment, scenario: int, num_agents: int, velocity: float,
-          start=(0, 0, 1000), iterations: int = 2000, time_limit: float = 20.0, seed: int = 0):
+          start=(0, 0, 1000), iterations: int = 20000, time_limit: float = 20.0, seed: int = 0):
     """Return an OptimalSolution for the scenario, or None if no run ever succeeded."""
     match scenario:
         case 0:
@@ -59,7 +61,7 @@ def _solve_single_target(environment, velocity, start):
         AgentHandler.update_velocity(handler, agent)
         agent.step()
         rounds += 1
-    return OptimalSolution(agent.distance_traveled, rounds, 1, 1)
+    return OptimalSolution(agent.distance_traveled, rounds, 1, 1, agent.distance_traveled, float(rounds))
 
 
 # Scenario 1: many randomized runs, keep the one with the smallest distance.
@@ -69,6 +71,7 @@ def _solve_multi_target(environment, num_agents, velocity, start, iterations, ti
 
     best_distance = best_distance_rounds = best_rounds = None
     successes = ran = 0
+    sum_distance = sum_rounds = 0.0
     deadline = time.perf_counter() + time_limit
 
     for _ in range(iterations):
@@ -80,14 +83,16 @@ def _solve_multi_target(environment, num_agents, velocity, start, iterations, ti
             continue
         distance, rounds = result
         successes += 1
+        sum_distance += distance
+        sum_rounds += rounds
         if best_distance is None or (distance, rounds) < (best_distance, best_distance_rounds):
             best_distance, best_distance_rounds = distance, rounds
         if best_rounds is None or rounds < best_rounds:
             best_rounds = rounds
 
-    if best_distance is None:
-        return None
-    return OptimalSolution(best_distance, best_rounds, ran, successes)
+        if best_distance is None:
+            return None
+    return OptimalSolution(best_distance, best_rounds, ran, successes,sum_distance / successes, sum_rounds / successes)
 
 
 def _run_once(rng, spec, num_agents, velocity, start, alpha):

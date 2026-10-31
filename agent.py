@@ -10,13 +10,22 @@ from htn_planner import RulePlanner, RuleHTNPlanner, PlanningBudgetExceeded, Pla
 import statistics
 import httpx
 
+"""
+Agent:  Represents an AI agent-controlled drone, and contains relevant information such as location
+        and agent history. Mostly contains functions for prompting the agents.
+
+AgentHandler:   A class that helps the simulation "handle" agents. Parses the agent's outputs,
+                computes their velocity, handles prompting. It should be emphasized that this class
+                is for programming convenience only; it should NOT be used as a centralized manager
+                that exchanges information to and from agents freely, as that would undermine the
+                goal of the research.
+
+"""
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-# Backend: defaults to a local vLLM server (the cluster). For the hosted NVIDIA API:
-#   export LLM_BASE_URL=https://integrate.api.nvidia.com/v1
-#   export NVIDIA_API_KEY=nvapi-...
-#   export MODEL=nvidia/nemotron-3-ultra-550b-a55b      (optional; this is the default)
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
 LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
 LLM_MODEL = os.environ.get("MODEL", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16")
@@ -159,6 +168,10 @@ class Agent:
         self.htn = RulePlanner(HTN_TIME_BUDGET_SECONDS)
         self.delegated = False
 
+"""
+_create:    prompts the AI, and records various timing & token metrics of the AI's output.
+            returns the reasoning and the non-reasoning parts of the response separately.
+"""
     def _create(self, messages):
         t0 = time.perf_counter()
         reasoning, content = [], []
@@ -166,6 +179,7 @@ class Agent:
         finish = usage = stream = None
         timed_out = False
         try:
+            # Handles the AI output as a stream, so it can record reasoning vs answering time
             stream = self.client.chat.completions.create(
                 model=self.model, messages=messages,
                 max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
@@ -217,6 +231,7 @@ class Agent:
         }
         return "".join(reasoning), "".join(content)
 
+    # Prompt the AI using _create, apply some error & text parsing.
     def generate_response(self, message):
         messages = self.history + self.recent + [{"role": "user", "content": message}]
         started = time.perf_counter()
@@ -294,6 +309,7 @@ class AgentHandler:
         self.drone_velocity = 100
         self.sim_start = None
         self.sim_end = None
+        self.failed_inference_chance = 0.05
 
         self.system_prompt = SYSTEM_PROMPTS[PROMPT_STYLE]
 
@@ -337,6 +353,7 @@ class AgentHandler:
     def get_total_distance_traveled(self):
         return sum(agent.distance_traveled for agent in self.agents)
 
+    # Returns the average number of unnecessary vists across each target
     def get_revisit_rate(self):
         targets = self.environment.target_locations
         if not targets:
@@ -355,7 +372,7 @@ class AgentHandler:
         times = [t for agent in self.agents for t in agent.response_times]
         return sum(times) / len(times) if times else None
 
-    def log_summary(self, success: bool, optimal=None):
+    def log_summary(self, success: bool, optimal=None, rule=None):
         # total_distance_traveled: Collective distance traveled by all drones
         # revisit_rate: The rate at which drones visited targets they did not need to (rough approximation of poor division of labor)
         # success: Whether or not the simulation succeeded
@@ -372,22 +389,29 @@ class AgentHandler:
         # std_completion_tokens: Std deviation of completion tokens.
         # optimal_distance: Estimated optimal solution (system is not gaurenteed to find best possible solution)
         # optimal_rounds: The number of rounds the estimated optimal solution took to finish.
+        # avg_distance: The average distance the drones would fly if they made decisions completely at random.
+        # avg_rounds: The average number of rounds the drones would take to finish if they made decisions completely at random.
         # prompt_style: the prompt style used.
         # planning_style: the planning style used.
         # num_agents: the number of agents in the simulation
         # num_exclusive: The number of exclusive targets.
         # num_joint: The number of joint targets.
         # num_sequential: The number of sequential targets.
+        # num_targets: The total number of targets.
         # area_size: Radius of the simulation area, in meters.
         # agent_speed: The maximum distance an agent can move in a round, in meters.
         # num_llm_calls: The number of times an agent was prompted
         # timeout_rate: The frequency that a model timed out.
         # invalid_json_rate: The frequency that a model output in an invalid format
+        # failed_inference_chance: The chance that a drone will mistake which target a teammate is heading to
+        # rule_avg_distance: The average distance of the simulations in the non-LLM, non-HTN setup. For comparison only.
+        # rule_avg_rounds: The average number of rounds required in the simulations of the non-LLM, non-HTN setup. For comparison only.
         header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality",
           "sim_time_seconds", "avg_ttft", "std_ttft", "avg_reasoning_s", "std_reasoning_s",
           "avg_answer_s", "std_answer_s", "avg_completion_tokens", "std_completion_tokens", "optimal_distance",
-          "optimal_rounds", "prompt style", "planning style", "num_agents", "num_exclusive", "num_joint", "num_sequential", "area_size", "agent_speed",
-          "num_llm_calls", "timeout_rate", "invalid_json_rate"]
+          "optimal_rounds", "avg_distance", "avg_rounds", "prompt style", "planning style", "num_agents",
+          "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
+          "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance"]
         
         avg_response = self.get_average_response_time()
         
@@ -410,17 +434,21 @@ class AgentHandler:
             self._std_stat("completion_tokens"),
             "" if optimal is None else f"{optimal.distance:.2f}",
             "" if optimal is None else optimal.rounds,
+            "" if optimal is None else f"{optimal.avg_distance:.2f}",
+            "" if optimal is None else f"{optimal.avg_rounds:.2f}",
             PROMPT_STYLE,
             PLANNER_MODE,
             self.num_agents,
             target_types[0],
             target_types[1],
             target_types[2],
+            sum(target_types),
             self.environment.area_size_m,
             self.drone_velocity,
             self._num_calls(),
             self._rate_stat("timed_out"),
-            self._rate_stat("invalid_json")
+            self._rate_stat("invalid_json"),
+            self.failed_inference_chance
         ]
 
         os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)
@@ -449,6 +477,8 @@ class AgentHandler:
             writer = csv.writer(f)
             writer.writerow(header)
 
+    # Records the Agent decisions round-by-round. Not generally useful, but
+    # possibly helpful for debugging.
     def log_round(self):
         agent_targets = [
             agent.target_index if agent.target_index is not None else -1
@@ -467,9 +497,12 @@ class AgentHandler:
 
     # Update all agents on the situation, ask for a new course of action (or continue the current one)
     def update_agents(self):
+
+        # Record when the simulation started
         if self.sim_start is None:
             self.sim_start = time.perf_counter()
-        # Snapshot who needs a decision before any responses change targets
+
+        # Decide who should or should not reason this round
         to_prompt = [idx for idx in range(self.num_agents) if self.should_prompt(self.agents[idx])]
         print(f"Round {self.num_rounds}: prompting agents {to_prompt}")
 
@@ -536,7 +569,7 @@ class AgentHandler:
             return
 
         #IDLE: Set velocity to zero.
-        #FLY X: Set velocity similar to previous implementation
+        #FLY X: Set velocity to fly to target X
         #RECALL: Set inaction to True, set velocity to go back to start.
         action = str(data.get("action", ""))
         if action == "IDLE":
@@ -563,6 +596,7 @@ class AgentHandler:
 
 
     # Set velocity to go towards the target.
+    # TODO: change velocity based on how much time the agent spent thinking?
     def update_velocity(self, agent):
         if agent.target_index is None or agent.target_index == -1:
             agent.velocity = [0, 0, 0]
@@ -630,7 +664,11 @@ class AgentHandler:
                     else:
                         mate_target = self.environment.target_locations[teammate.last_target]
                         teammate_target = f"{mate_target.target_type.value} {teammate.last_target}"
-                    update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
+
+                    if random.random() > self.failed_inference_chance:
+                        update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
+                    else:
+                        random_target = random.randint(0, len(self.environment.target_locations))
                     
                     if self.comms_quality > 0.0:
                         if self.comms_distance == -1 or geo.geometric_mean_3d(teammate_location[0], teammate_location[1], teammate_location[2], agent.location[0], agent.location[1], agent.location[2]) <= self.comms_distance:
@@ -688,6 +726,7 @@ class AgentHandler:
         print("End AI prompt\n")
         return update_message
 
+    # Utility for certain styles of prompt
     def number_to_letters(self, n: int) -> str:
         if n < 0:
             raise ValueError("n must be non-negative")
@@ -710,19 +749,20 @@ class AgentHandler:
     def check_stalled(self):
         return all(agent.inaction for agent in self.agents)
 
+    # Decide whether or not the agent should reason this round
     def should_prompt(self, agent) -> bool:
-        """Decide whether this agent needs a new decision this round."""
         # Recalled/inactive agents are never prompted
         if agent.inaction or agent.target_index == "Home":
             return False
 
-        # Doing nothing: never assigned (-1) or chose IDLE (None)
+        # The agent is doing nothing: never assigned (-1) or chose IDLE (None)
+        # Always prompt idle agents
         if agent.target_index is None or agent.target_index == -1:
             return True
 
         target = self.environment.target_locations[agent.target_index]
 
-        # Arrived at its intended location
+        # Arrived at its intended location, needs a new target
         if geo.point_distance(agent.location, target.get_location()) < VISIT_RADIUS_METERS:
             return True
 
@@ -732,6 +772,8 @@ class AgentHandler:
         # Target no longer needs this drone (already cleared, or too many drones assigned)
         return self._is_surplus(agent, target)
 
+    # Check if there is no need for the given agent to go to the given target
+    # Mostly important for if there are too many drones going to one target.
     def _is_surplus(self, agent, target) -> bool:
         sequential = target.target_type == TargetType.SEQUENTIAL
 
@@ -754,6 +796,10 @@ class AgentHandler:
         rivals.sort(key=lambda a: (geo.point_distance(a.location, target_location), a.agent_index))
         return agent not in rivals[:slots]
 
+
+"""
+Statistical helper functions
+"""
     def _avg_stat(self, key):
         vals = [s[key] for a in self.agents for s in a.call_stats if s.get(key) is not None]
         return "" if not vals else f"{sum(vals)/len(vals):.3f}"
