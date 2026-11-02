@@ -23,6 +23,8 @@ MAX_ROUNDS = 400
 # ---------------------------------------------------------------------------
 # What a drone is allowed to know
 # ---------------------------------------------------------------------------
+
+# TargetView: Represents all information related to a target
 @dataclass(frozen=True)
 class TargetView:
     index: int
@@ -35,20 +37,21 @@ class TargetView:
     distance: Optional[float] = None      # from me, only if coordinates are shown
 
 
+# TeammateView: Represents all information related to a teammate
 @dataclass(frozen=True)
 class TeammateView:
     index: int
     last_target: object                   # int target index, None (idle), or -1 (unknown yet)
     message: Optional[str]                # None if out of range or comms disabled
 
-
+# Observation: the entirety of information a drone is given
 @dataclass(frozen=True)
 class Observation:
     agent_index: int
     num_agents: int
-    current_target: object                # my own last order: int, None, or -1
+    current_target: object                # Target the agent selected last round
     own_location: Optional[tuple]         # only if SHOW_OWN_LOCATION
-    teammates: tuple                      # active (not recalled) teammates only
+    teammates: tuple                      # active teammates only; recalled teammates do no appear
     targets: tuple
     all_cleared: bool
 
@@ -71,44 +74,79 @@ class Decision:
 # ---------------------------------------------------------------------------
 # Policies
 # ---------------------------------------------------------------------------
+# These classes relate to how the drones make decisions
+
 class DronePolicy:
     """One instance per drone. Keep any memory on self; instances never share state."""
 
     def __init__(self, agent_index: int, num_agents: int, rng: random.Random):
         self.agent_index = agent_index
         self.num_agents = num_agents
-        self.rng = rng
+        self.rng = rng # A seeded random number generator
         self.memory = {}
 
     def decide(self, obs: Observation) -> Decision:
         raise NotImplementedError
 
 
+# The rules that dictate how drones decide what to do
 class RulePolicy(DronePolicy):
 
     def decide(self, obs: Observation) -> Decision:
-        # ------------------------------------------------------------------
-        # IMPLEMENT YOUR RULES HERE.
-        # Everything you may use is in `obs` (and self.memory / self.rng):
-        #   obs.agent_index, obs.num_agents, obs.current_target
-        #   obs.targets[i]: kind, cleared, required_drones, visited_by_me, claimants,
-        #                   location/distance (only if coordinates are shown)
-        #   obs.teammates[k]: index, last_target, message
-        #   obs.available_targets(), obs.others_on(target), obs.all_cleared
-        # ------------------------------------------------------------------
-
-        # Stand-in so the framework runs end to end; replace everything below.
+        # If no targets left, go home
         if obs.all_cleared:
-            return Decision("RECALL")        # required for the mission to finish
-        available = obs.available_targets()
-        if not available:
-            return Decision("IDLE")          # only Sequentials I already visited remain
-        return Decision(f"FLY {available[0].index}")
+            return Decision("RECALL")
 
+        me = obs.agent_index
+        target = {t.index: t for t in obs.targets}
+
+        def holds(last):
+            """True if an order of `last` is still a live claim on an uncleared target."""
+            return isinstance(last, int) and last >= 0 and not target[last].cleared
+
+        # 1. Keep an existing claim, unless it is a Sequential this drone has already visited
+        mine = obs.current_target
+        released = False
+        if holds(mine):
+            t = target[mine]
+            if t.kind == TargetType.SEQUENTIAL and t.visited_by_me:
+                released = True
+            else:
+                return Decision(f"FLY {mine}", f"Continuing to target {mine}.")
+
+        # 2. Who is going to what, who is free (currently the same for every drone)
+        orders = {me: mine, **{m.index: m.last_target for m in obs.teammates}}
+        claims = {t.index: 0 for t in obs.targets}
+        free = []
+        for i in sorted(orders):
+            if holds(orders[i]):
+                claims[orders[i]] += 1
+            else:
+                free.append(i)
+
+        # 3. Open slots, listed by target index (a target appears once per unclaimed slot)
+        slots = []
+        for t in obs.targets:
+            if not t.cleared:
+                slots += [t.index] * max(0, t.required_drones - claims[t.index])
+
+        # 4. Free drones take slots in agent order: the k-th free drone takes the k-th open slot.
+        #    A drone leaving a Sequential isn't in the others' free list, so it takes the next slot after theirs.
+        rank = len(free) if released else free.index(me)
+        for j in slots[rank:]:
+            t = target[j]
+            if t.kind == TargetType.SEQUENTIAL and t.visited_by_me:
+                continue             # can't count twice toward the same Sequential
+            return Decision(f"FLY {j}", f"Taking target {j}.")
+
+        # More free drones than open slots; using IDLE instead of RECALL in case more spots open in the future
+        # Adding targets mid-simulation currently isn't a thing, but may be in the future
+        return Decision("IDLE")
 
 # ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
+# The implementation for the simulation
 @dataclass
 class RuleResult:
     trials: int

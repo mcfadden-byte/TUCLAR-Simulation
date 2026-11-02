@@ -49,7 +49,7 @@ SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
 SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
 
 # Planner backend (used when PLANNER_MODE == "htn"):
-#   "rule"  deterministic role-assignment rules
+#   "rule"  deterministic non-HTN role-assignment rules
 #   "htn_llm"   determinisitic HTN planning, creating an Area hierarchy. Will delegate to LLM if it takes too long.
 #   "llm" llm only, no deterministic planning.
 PLANNER_MODE = "llm"
@@ -158,7 +158,7 @@ class Agent:
         self.distance_traveled = 0.0
         self.displayed_message = "Yet to act, no message for now."
         self.response_times = []
-        self.last_stats = []
+        self.last_stats = {}
         self.call_stats = []
 
 
@@ -168,10 +168,9 @@ class Agent:
         self.htn = RulePlanner(HTN_TIME_BUDGET_SECONDS)
         self.delegated = False
 
-"""
-_create:    prompts the AI, and records various timing & token metrics of the AI's output.
-            returns the reasoning and the non-reasoning parts of the response separately.
-"""
+    
+# _create:    prompts the AI, and records various timing & token metrics of the AI's output.
+#            returns the reasoning and the non-reasoning parts of the response separately.    
     def _create(self, messages):
         t0 = time.perf_counter()
         reasoning, content = [], []
@@ -210,7 +209,7 @@ _create:    prompts the AI, and records various timing & token metrics of the AI
                     content.append(d.content)
                     if t_reason_end is None and "</think>" in "".join(content):
                         t_reason_end = now
-        except APITimeoutError:
+        except (APITimeoutError, httpx.TimeoutException):
             timed_out = True
         finally:
             if stream is not None:
@@ -304,9 +303,10 @@ class AgentHandler:
         self.scenario = scenario
         self.environment = environment
         self.num_rounds = 0
-        self.comms_quality = 0.0 #Set to 1 for perfect comms
-        self.comms_distance = 1000 #Set to -1 for infinite range
-        self.drone_velocity = 100
+        self.comms_quality = comms_quality #Set to 1 for perfect comms
+        self.comms_distance = comms_distance #Set to -1 for infinite range
+        self.drone_velocity = 300
+        self.seconds_per_round = LLM_TIME_LIMIT_SECONDS
         self.sim_start = None
         self.sim_end = None
         self.failed_inference_chance = 0.05
@@ -315,6 +315,7 @@ class AgentHandler:
 
         self.scenario_system_prompts = {
 
+            # Scenario 0 is a test scenario, N/A for the research
             0: """
                 MISSION REQUIREMENTS:
                     1. You will be given a target location and a current location.
@@ -363,7 +364,7 @@ class AgentHandler:
 
     def get_sim_time(self):
         """Seconds from the start of the first round to the end of the last one."""
-        if self.sim_start is None:
+        if self.sim_start is None or self.sim_end is None:
             return 0.0
         return self.sim_end - self.sim_start
 
@@ -409,7 +410,8 @@ class AgentHandler:
         header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality",
           "sim_time_seconds", "avg_ttft", "std_ttft", "avg_reasoning_s", "std_reasoning_s",
           "avg_answer_s", "std_answer_s", "avg_completion_tokens", "std_completion_tokens", "optimal_distance",
-          "optimal_rounds", "avg_distance", "avg_rounds", "prompt style", "planning style", "num_agents",
+          "optimal_rounds", "rule_success_rate", "rule_avg_distance", "rule_avg_rounds", "rule_invalid_actions",
+          "avg_distance", "avg_rounds", "prompt style", "planning style", "num_agents",
           "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
           "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance"]
         
@@ -436,6 +438,10 @@ class AgentHandler:
             "" if optimal is None else optimal.rounds,
             "" if optimal is None else f"{optimal.avg_distance:.2f}",
             "" if optimal is None else f"{optimal.avg_rounds:.2f}",
+            "" if rule is None else f"{rule.success_rate:.2f}",
+            "" if rule is None or rule.avg_distance is None else f"{rule.avg_distance:.2f}",
+            "" if rule is None or rule.avg_rounds is None else f"{rule.avg_rounds:.2f}",
+            "" if rule is None else rule.invalid_actions,
             PROMPT_STYLE,
             PLANNER_MODE,
             self.num_agents,
@@ -509,6 +515,13 @@ class AgentHandler:
         for idx in to_prompt:
             self.decide(idx)
 
+        for agent in self.agents:
+            t = agent.target_index
+            if isinstance(t, int) and t >= 0:
+                target = self.environment.target_locations[t]
+                if target.cleared or (target.target_type == TargetType.SEQUENTIAL and agent.agent_index in target.visitors):
+                    agent.target_index = None
+
         for idx in range(0, self.num_agents):
             if not self.agents[idx].inaction:
                 self.agents[idx].last_target = self.agents[idx].target_index
@@ -581,19 +594,18 @@ class AgentHandler:
             try:
                 index = int(action.removeprefix("FLY "))
                 if 0 <= index < len(self.environment.target_locations):
-                    agent.target_index = index
+                    t = self.environment.target_locations[index]
+                    if t.cleared or (t.target_type == TargetType.SEQUENTIAL and agent_index in t.visitors):
+                        print(f"Agent {agent_index} chose unavailable target {index}; idling.")
+                        agent.target_index = None
+                    else:
+                        agent.target_index = index
                 else:
                     print(f"Agent {agent_index} gave out-of-range FLY index: {index}")
             except ValueError:
                 print(f"Agent {agent_index} gave malformed FLY action: {action!r}")
         else:
             print(f"Agent {agent_index} gave unrecognized action: {action!r}")
-
-        if random.random() < self.comms_quality:
-            agent.displayed_message = data.get("message", "")
-        else:
-            agent.displayed_message = "Communication Failure."
-
 
     # Set velocity to go towards the target.
     # TODO: change velocity based on how much time the agent spent thinking?
@@ -665,11 +677,11 @@ class AgentHandler:
                         mate_target = self.environment.target_locations[teammate.last_target]
                         teammate_target = f"{mate_target.target_type.value} {teammate.last_target}"
 
-                    if random.random() > self.failed_inference_chance:
-                        update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
-                    else:
-                        random_target = random.randint(0, len(self.environment.target_locations))
-                    
+                    if random.random() < self.failed_inference_chance:
+                        wrong = random.randrange(len(self.environment.target_locations))
+                        teammate_target = f"{self.environment.target_locations[wrong].target_type.value} {wrong}"
+                    update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
+                                        
                     if self.comms_quality > 0.0:
                         if self.comms_distance == -1 or geo.geometric_mean_3d(teammate_location[0], teammate_location[1], teammate_location[2], agent.location[0], agent.location[1], agent.location[2]) <= self.comms_distance:
                             update_message += f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n"
@@ -797,9 +809,7 @@ class AgentHandler:
         return agent not in rivals[:slots]
 
 
-"""
-Statistical helper functions
-"""
+# Statistical helper functions
     def _avg_stat(self, key):
         vals = [s[key] for a in self.agents for s in a.call_stats if s.get(key) is not None]
         return "" if not vals else f"{sum(vals)/len(vals):.3f}"
