@@ -1,14 +1,20 @@
-from environment import Environment, TargetType, VISIT_RADIUS_METERS
-import json
-import utils_geometry as geo
-from openai import OpenAI, BadRequestError, APITimeoutError
-import os
 import csv
+import json
+import os
 import random
-import time
-from htn_planner import RulePlanner, RuleHTNPlanner, PlanningBudgetExceeded, PlanningFailed
 import statistics
+import time
+
 import httpx
+from openai import APITimeoutError, BadRequestError, OpenAI
+
+import utils_geometry as geo
+from environment import VISIT_RADIUS_METERS, Environment, TargetType
+from htn_planner import (
+    PlanningBudgetExceeded,
+    PlanningFailed,
+    RulePlanner,
+)
 
 """
 Agent:  Represents an AI agent-controlled drone, and contains relevant information such as location
@@ -309,7 +315,7 @@ class AgentHandler:
         self.seconds_per_round = LLM_TIME_LIMIT_SECONDS
         self.sim_start = None
         self.sim_end = None
-        self.failed_inference_chance = 0.05
+        self.failed_inference_chance = 0.15
 
         self.system_prompt = SYSTEM_PROMPTS[PROMPT_STYLE]
 
@@ -325,7 +331,7 @@ class AgentHandler:
             1: """
                 MISSION REQUIREMENTS:
                     1. There is a series of locations that you will be given.
-                    2. You will have a series of teammates. All your teammates reason exactly the same as you.
+                    2. You will have a series of teammates. All your teammates reason exactly the same as you. The prompt will tell you what they are doing, but each prompt has a chance of giving the wrong value. Be cautious of this input error.
                     3. The mission is a success once all target locations are cleared, and you have used the RECALL action to go back to start.
                     4. There are three types of target location: Sequential, which must be visited by three different agents at any point (you do not need to all visit at the same time). Joint, which must be visited by two different agents at the *same time*. And Exclusive, which must be visited by any agent.
                     5. Complete the mission as quick as possible.
@@ -343,7 +349,7 @@ class AgentHandler:
 
         self.num_agents = num_agents
         self.agents = []
-        for idx in range(0,num_agents):
+        for idx in range(num_agents):
             self.agents.append(Agent(system_prompt=self.system_prompt, client=self.client, model=self.model, start_location=[0, 0, 1000], agent_index=idx)) #TODO: Have system that detects ground level?
 
         self.log_path = log_path
@@ -411,13 +417,10 @@ class AgentHandler:
           "sim_time_seconds", "avg_ttft", "std_ttft", "avg_reasoning_s", "std_reasoning_s",
           "avg_answer_s", "std_answer_s", "avg_completion_tokens", "std_completion_tokens", "optimal_distance",
           "optimal_rounds", "rule_success_rate", "rule_avg_distance", "rule_avg_rounds", "rule_invalid_actions",
-          "avg_distance", "avg_rounds", "prompt style", "planning style", "num_agents",
+          "prompt_style", "planning_style", "num_agents",
           "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
           "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance"]
         
-        avg_response = self.get_average_response_time()
-        
-
         target_types = self.environment.get_target_amounts()
         row = [
             f"{self.get_total_distance_traveled():.2f}",
@@ -436,8 +439,6 @@ class AgentHandler:
             self._std_stat("completion_tokens"),
             "" if optimal is None else f"{optimal.distance:.2f}",
             "" if optimal is None else optimal.rounds,
-            "" if optimal is None else f"{optimal.avg_distance:.2f}",
-            "" if optimal is None else f"{optimal.avg_rounds:.2f}",
             "" if rule is None else f"{rule.success_rate:.2f}",
             "" if rule is None or rule.avg_distance is None else f"{rule.avg_distance:.2f}",
             "" if rule is None or rule.avg_rounds is None else f"{rule.avg_rounds:.2f}",
@@ -522,7 +523,7 @@ class AgentHandler:
                 if target.cleared or (target.target_type == TargetType.SEQUENTIAL and agent.agent_index in target.visitors):
                     agent.target_index = None
 
-        for idx in range(0, self.num_agents):
+        for idx in range(self.num_agents):
             if not self.agents[idx].inaction:
                 self.agents[idx].last_target = self.agents[idx].target_index
 
@@ -607,6 +608,11 @@ class AgentHandler:
         else:
             print(f"Agent {agent_index} gave unrecognized action: {action!r}")
 
+        if random.random() < self.comms_quality:
+            agent.displayed_message = data.get("message", "")
+        else:
+            agent.displayed_message = "Communication Failure."
+
     # Set velocity to go towards the target.
     # TODO: change velocity based on how much time the agent spent thinking?
     def update_velocity(self, agent):
@@ -663,7 +669,7 @@ class AgentHandler:
                 if SHOW_OWN_LOCATION:
                     update_message += f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
 
-                for idx in range(0, len(self.agents)):
+                for idx in range(len(self.agents)):
                     if idx == agent_index or self.agents[idx].inaction:
                         continue
                     teammate = self.agents[idx]
@@ -715,7 +721,7 @@ class AgentHandler:
 
                     # If Theory of Scene is not being used, use a more generic format
                     else:
-                        update_message += f"The following targets have yet to be visited:\n"
+                        update_message += "The following targets have yet to be visited:\n"
                         for idx, target in enumerate(self.environment.target_locations):
                             if target.visited:
                                 pass

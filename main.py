@@ -1,19 +1,18 @@
 import warnings
+
 warnings.filterwarnings('ignore')
-import matplotlib.pyplot as plt
-import contextily as ctx
-import pymap3d as pm
-from matplotlib.ticker import ScalarFormatter
-import utils_geometry as geo
-import random
-import time
-from agent import Agent, AgentHandler
-import threading
-import queue
 import os
+import queue
+import threading
+import time
+
+import contextily as ctx
+import matplotlib.pyplot as plt
+
 import find_optimal
 import rule_baseline
-
+import utils_geometry as geo
+from agent import AgentHandler
 from environment import Environment
 
 HEADLESS = not os.environ.get("DISPLAY")
@@ -188,7 +187,7 @@ def agent_worker(sim, response_queue):
 
 
 if __name__ == "__main__":
-    for i in range(0,2):
+    for i in range(2):
         # Metrics we'll use to measure the quality of success
         num_rounds: int
         num_visits: int
@@ -199,7 +198,7 @@ if __name__ == "__main__":
         sim.init_handler()
         sim.show_map()
         optimal = sim.find_optimal()
-        rule = rule_baseline.evaluate(sim.environment, sim.handler.num_agents, sim.handler.drone_velocity, comms_quality=sim.handler.comms_quality, comms_distance=sim.handler.comms_distance)
+        rule = rule_baseline.evaluate(sim.environment, sim.handler.num_agents, sim.handler.drone_velocity, comms_quality=sim.handler.comms_quality, comms_distance=sim.handler.comms_distance, failed_inference_chance=sim.handler.failed_inference_chance, trials=50)
 
         response_queue = queue.Queue()
         worker = threading.Thread(target=agent_worker, args=(sim, response_queue), daemon=True)

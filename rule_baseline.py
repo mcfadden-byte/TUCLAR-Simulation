@@ -9,10 +9,9 @@ the simulator's own methods, as in optimal.py.
 import random
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
 
 import utils_geometry as geo
-from agent import Agent, AgentHandler, SHOW_OWN_LOCATION, SHOW_TARGET_COORDS
+from agent import SHOW_OWN_LOCATION, SHOW_TARGET_COORDS, Agent, AgentHandler
 from environment import Environment, TargetLocation, TargetType
 
 HOME = [0, 0, 0]
@@ -33,8 +32,8 @@ class TargetView:
     required_drones: int
     visited_by_me: bool
     claimants: tuple                      # agent indices (incl. me) whose last order was this target
-    location: Optional[tuple] = None      # (north, east, alt), only if coordinates are shown
-    distance: Optional[float] = None      # from me, only if coordinates are shown
+    location: tuple | None = None      # (north, east, alt), only if coordinates are shown
+    distance: float | None = None      # from me, only if coordinates are shown
 
 
 # TeammateView: Represents all information related to a teammate
@@ -42,7 +41,7 @@ class TargetView:
 class TeammateView:
     index: int
     last_target: object                   # int target index, None (idle), or -1 (unknown yet)
-    message: Optional[str]                # None if out of range or comms disabled
+    message: str | None                # None if out of range or comms disabled
 
 # Observation: the entirety of information a drone is given
 @dataclass(frozen=True)
@@ -50,7 +49,7 @@ class Observation:
     agent_index: int
     num_agents: int
     current_target: object                # Target the agent selected last round
-    own_location: Optional[tuple]         # only if SHOW_OWN_LOCATION
+    own_location: tuple | None         # only if SHOW_OWN_LOCATION
     teammates: tuple                      # active teammates only; recalled teammates do no appear
     targets: tuple
     all_cleared: bool
@@ -151,26 +150,33 @@ class RulePolicy(DronePolicy):
 class RuleResult:
     trials: int
     success_rate: float
-    avg_distance: Optional[float]         # over successful trials
-    avg_rounds: Optional[float]           # over successful trials
+    avg_distance: float | None         # over successful trials
+    avg_rounds: float | None           # over successful trials
     invalid_actions: int                  # total across all trials
 
 
-def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, show_own_location):
+def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance=0.0, noise_rng=None):
     teammates = []
     for other in agents:
         if other is me or other.inaction:
             continue
+
+        last = other.last_target
+        if noise_rng is not None and noise_rng.random() < failed_inference_chance:
+            last = noise_rng.randrange(len(targets))
+
         message = None
         if comms_quality > 0.0:
             in_range = (comms_distance == -1 or
                         geo.geometric_mean_3d(*other.location, *me.location) <= comms_distance)
             message = other.displayed_message if in_range else None
-        teammates.append(TeammateView(other.agent_index, other.last_target, message))
+        teammates.append(TeammateView(other.agent_index, last, message))
+
+    seen = {me.agent_index: me.last_target, **{t.index: t.last_target for t in teammates}}
 
     views = []
     for j, t in enumerate(targets):
-        claimants = tuple(a.agent_index for a in agents if a.last_target == j and not a.inaction)
+        claimants = tuple(sorted(i for i, lt in seen.items() if lt == j))
         loc = dist = None
         if show_coords:
             loc = t.get_location()
@@ -220,7 +226,7 @@ def _apply(agent, decision, targets, comms_quality, rng):
 
 
 def run_once(spec, num_agents, velocity, start, policy_factory,
-             comms_quality, comms_distance, show_coords, show_own_location, seed):
+             comms_quality, comms_distance, show_coords, show_own_location, seed, failed_inference_chance=0.0):
     rng = random.Random(seed)
     targets = [TargetLocation(n, e, a, kind) for n, e, a, kind in spec]
     env = SimpleNamespace(target_locations=targets)
@@ -228,12 +234,13 @@ def run_once(spec, num_agents, velocity, start, policy_factory,
     agents = [Agent("", None, "", list(start), i) for i in range(num_agents)]
     policies = [policy_factory(i, num_agents, random.Random(rng.getrandbits(32)))
                 for i in range(num_agents)]
+    noise_rng = random.Random(rng.getrandbits(32))
     invalid = 0
 
     for rounds in range(1, MAX_ROUNDS + 1):
         # Snapshot first: every drone decides from the same pre-round state
         observations = {a.agent_index: _observe(a, agents, targets, comms_quality, comms_distance,
-                                                show_coords, show_own_location)
+                                                show_coords, show_own_location, failed_inference_chance, noise_rng)
                         for a in agents if not a.inaction}
         decisions = {i: policies[i].decide(obs) for i, obs in observations.items()}
 
@@ -257,13 +264,13 @@ def run_once(spec, num_agents, velocity, start, policy_factory,
 
 def evaluate(environment, num_agents, velocity, start=(0, 0, 1000), policy_factory=RulePolicy,
              trials=1, comms_quality=0.0, comms_distance=1000,
-             show_coords=SHOW_TARGET_COORDS, show_own_location=SHOW_OWN_LOCATION, seed=0):
+             show_coords=SHOW_TARGET_COORDS, show_own_location=SHOW_OWN_LOCATION, seed=0, failed_inference_chance=0.0):
     spec = [(t.north_m, t.east_m, t.alt, t.target_type) for t in environment.target_locations]
     dists, rounds_list, invalid_total = [], [], 0
     for k in range(trials):
         ok, dist, rounds, invalid = run_once(spec, num_agents, velocity, start, policy_factory,
                                              comms_quality, comms_distance,
-                                             show_coords, show_own_location, seed + k)
+                                             show_coords, show_own_location, seed + k, failed_inference_chance)
         invalid_total += invalid
         if ok:
             dists.append(dist)
