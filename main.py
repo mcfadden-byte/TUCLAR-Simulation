@@ -1,19 +1,18 @@
 import warnings
+
 warnings.filterwarnings('ignore')
-import matplotlib.pyplot as plt
-import contextily as ctx
-import pymap3d as pm
-from matplotlib.ticker import ScalarFormatter
-import utils_geometry as geo
-import random
-import time
-from agent import Agent, AgentHandler
-import threading
-import queue
 import os
+import queue
+import threading
+import time
+
+import contextily as ctx
+import matplotlib.pyplot as plt
+
 import find_optimal
 import rule_baseline
-
+import utils_geometry as geo
+from agent import AgentHandler
 from environment import Environment
 
 HEADLESS = not os.environ.get("DISPLAY")
@@ -188,7 +187,7 @@ def agent_worker(sim, response_queue):
 
 
 if __name__ == "__main__":
-    for i in range(0,2):
+    for i in range(2):
         # Metrics we'll use to measure the quality of success
         num_rounds: int
         num_visits: int

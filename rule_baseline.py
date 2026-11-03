@@ -9,10 +9,9 @@ the simulator's own methods, as in optimal.py.
 import random
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
 
 import utils_geometry as geo
-from agent import Agent, AgentHandler, SHOW_OWN_LOCATION, SHOW_TARGET_COORDS
+from agent import SHOW_OWN_LOCATION, SHOW_TARGET_COORDS, Agent, AgentHandler, type_is_known
 from environment import Environment, TargetLocation, TargetType
 
 HOME = [0, 0, 0]
@@ -28,13 +27,13 @@ MAX_ROUNDS = 400
 @dataclass(frozen=True)
 class TargetView:
     index: int
-    kind: TargetType
+    kind: TargetType | None
     cleared: bool
-    required_drones: int
+    required_drones: int | None
     visited_by_me: bool
     claimants: tuple                      # agent indices (incl. me) whose last order was this target
-    location: Optional[tuple] = None      # (north, east, alt), only if coordinates are shown
-    distance: Optional[float] = None      # from me, only if coordinates are shown
+    location: tuple | None = None      # (north, east, alt), only if coordinates are shown
+    distance: float | None = None      # from me, only if coordinates are shown
 
 
 # TeammateView: Represents all information related to a teammate
@@ -42,7 +41,7 @@ class TargetView:
 class TeammateView:
     index: int
     last_target: object                   # int target index, None (idle), or -1 (unknown yet)
-    message: Optional[str]                # None if out of range or comms disabled
+    message: str | None                # None if out of range or comms disabled
 
 # Observation: the entirety of information a drone is given
 @dataclass(frozen=True)
@@ -50,7 +49,7 @@ class Observation:
     agent_index: int
     num_agents: int
     current_target: object                # Target the agent selected last round
-    own_location: Optional[tuple]         # only if SHOW_OWN_LOCATION
+    own_location: tuple | None         # only if SHOW_OWN_LOCATION
     teammates: tuple                      # active teammates only; recalled teammates do no appear
     targets: tuple
     all_cleared: bool
@@ -91,6 +90,7 @@ class DronePolicy:
 
 # The rules that dictate how drones decide what to do
 class RulePolicy(DronePolicy):
+    UNKNOWN_SLOT_GUESS = 1
 
     def decide(self, obs: Observation) -> Decision:
         # If no targets left, go home
@@ -128,7 +128,9 @@ class RulePolicy(DronePolicy):
         slots = []
         for t in obs.targets:
             if not t.cleared:
-                slots += [t.index] * max(0, t.required_drones - claims[t.index])
+                need = t.required_drones if t.required_drones is not None else self.UNKNOWN_SLOT_GUESS
+                slots += [t.index] * max(0, need - claims[t.index])
+
 
         # 4. Free drones take slots in agent order: the k-th free drone takes the k-th open slot.
         #    A drone leaving a Sequential isn't in the others' free list, so it takes the next slot after theirs.
@@ -151,8 +153,8 @@ class RulePolicy(DronePolicy):
 class RuleResult:
     trials: int
     success_rate: float
-    avg_distance: Optional[float]         # over successful trials
-    avg_rounds: Optional[float]           # over successful trials
+    avg_distance: float | None         # over successful trials
+    avg_rounds: float | None           # over successful trials
     invalid_actions: int                  # total across all trials
 
 
@@ -170,13 +172,20 @@ def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, sh
 
     views = []
     for j, t in enumerate(targets):
+        known = type_is_known(t, me.agent_index, type_visibility)
         claimants = tuple(a.agent_index for a in agents if a.last_target == j and not a.inaction)
         loc = dist = None
         if show_coords:
             loc = t.get_location()
             dist = geo.point_distance(me.location, loc)
-        views.append(TargetView(j, t.target_type, t.cleared, t.required_drones,
-                                me.agent_index in t.visitors, claimants, loc, dist))
+        views.append(TargetView(j,
+                                t.target_type if known else None,
+                                t.cleared,
+                                t.required_drones if known else None,
+                                me.agent_index in t.visitors,
+                                claimants,
+                                loc,
+                                dist))
 
     return Observation(
         agent_index=me.agent_index,

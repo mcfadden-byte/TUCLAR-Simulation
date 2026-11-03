@@ -7,14 +7,11 @@ Backends:
 Each drone has one planner; details from planners are not shared with each other.
 Planners are deterministic, and will be consistent between drones.
 """
-import json
-import re
 import time
+
 import numpy as np
 
-from openai import APITimeoutError
-
-from environment import TargetType, TargetLocation, Environment
+from environment import TargetType
 
 
 class PlanningBudgetExceeded(Exception):

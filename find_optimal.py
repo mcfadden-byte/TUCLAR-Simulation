@@ -12,7 +12,6 @@ so the benchmark follows the same mechanics (visit radius, Joint/Sequential clea
 The result is the best of N random tries, not a proof of optimality; more iterations can only
 improve it.
 """
-import math
 import random
 import time
 from dataclasses import dataclass
@@ -20,7 +19,7 @@ from types import SimpleNamespace
 
 import utils_geometry as geo
 from agent import Agent, AgentHandler
-from environment import Environment, TargetLocation, TargetType, VISIT_RADIUS_METERS
+from environment import VISIT_RADIUS_METERS, Environment, TargetLocation, TargetType
 
 HOME = [0, 0, 0]        # where RECALL sends a drone in AgentHandler.update_velocity
 HOME_TOLERANCE = 1      # same "home" test as Simulation.check_all_agents_home

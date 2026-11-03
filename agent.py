@@ -1,14 +1,20 @@
-from environment import Environment, TargetType, VISIT_RADIUS_METERS
-import json
-import utils_geometry as geo
-from openai import OpenAI, BadRequestError, APITimeoutError
-import os
 import csv
+import json
+import os
 import random
-import time
-from htn_planner import RulePlanner, RuleHTNPlanner, PlanningBudgetExceeded, PlanningFailed
 import statistics
+import time
+
 import httpx
+from openai import APITimeoutError, BadRequestError, OpenAI
+
+import utils_geometry as geo
+from environment import VISIT_RADIUS_METERS, Environment, TargetType
+from htn_planner import (
+    PlanningBudgetExceeded,
+    PlanningFailed,
+    RulePlanner,
+)
 
 """
 Agent:  Represents an AI agent-controlled drone, and contains relevant information such as location
@@ -55,6 +61,12 @@ SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and d
 PLANNER_MODE = "llm"
 HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN decision
 HTN_BACKEND = "rule"
+
+# EXPERIMENTAL
+#   "all"        every drone, always (original behavior)
+#   "any_visit"  every drone, once any drone has visited the target
+#   "own_visit"  a drone only learns a type by visiting that target itself
+TARGET_TYPE_VISIBILITY = "own_visit"
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -138,6 +150,16 @@ def split_reasoning(reasoning, content):
         reasoning, content = content.split("</think>", 1)
         reasoning = reasoning.replace("<think>", "")
     return reasoning.strip(), content.strip()
+
+
+# EXPERIMENTAL
+def type_is_known(target, agent_index, mode=None):
+    mode = mode or TARGET_TYPE_VISIBILITY
+    if mode == "all":
+        return True
+    if mode == "any_visit":
+        return bool(target.visitors)
+    return agent_index in target.visitors
 
 
 # Handles LLM calls & message history
@@ -340,10 +362,13 @@ class AgentHandler:
         }
 
         self.system_prompt += self.scenario_system_prompts[scenario]
+        if scenario == 1 and TARGET_TYPE_VISIBILITY != "all":
+            who = "any drone has" if TARGET_TYPE_VISIBILITY == "any_visit" else "you have"
+            self.system_prompt += (f"\nNOTE: A target's type is shown as \"type unknown\" until {who} visited it, so you may not know how many drones it needs.\n")
 
         self.num_agents = num_agents
         self.agents = []
-        for idx in range(0,num_agents):
+        for idx in range(num_agents):
             self.agents.append(Agent(system_prompt=self.system_prompt, client=self.client, model=self.model, start_location=[0, 0, 1000], agent_index=idx)) #TODO: Have system that detects ground level?
 
         self.log_path = log_path
@@ -407,15 +432,14 @@ class AgentHandler:
         # failed_inference_chance: The chance that a drone will mistake which target a teammate is heading to
         # rule_avg_distance: The average distance of the simulations in the non-LLM, non-HTN setup. For comparison only.
         # rule_avg_rounds: The average number of rounds required in the simulations of the non-LLM, non-HTN setup. For comparison only.
+        #TODO: Update this comment block
         header = ["total_distance_traveled", "revisit_rate", "success", "num_rounds", "comms_quality",
           "sim_time_seconds", "avg_ttft", "std_ttft", "avg_reasoning_s", "std_reasoning_s",
           "avg_answer_s", "std_answer_s", "avg_completion_tokens", "std_completion_tokens", "optimal_distance",
           "optimal_rounds", "rule_success_rate", "rule_avg_distance", "rule_avg_rounds", "rule_invalid_actions",
           "avg_distance", "avg_rounds", "prompt style", "planning style", "num_agents",
           "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
-          "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance"]
-        
-        avg_response = self.get_average_response_time()
+          "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance", "type_visibility"]
         
 
         target_types = self.environment.get_target_amounts()
@@ -454,7 +478,8 @@ class AgentHandler:
             self._num_calls(),
             self._rate_stat("timed_out"),
             self._rate_stat("invalid_json"),
-            self.failed_inference_chance
+            self.failed_inference_chance,
+            TARGET_TYPE_VISIBILITY
         ]
 
         os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)
@@ -522,7 +547,7 @@ class AgentHandler:
                 if target.cleared or (target.target_type == TargetType.SEQUENTIAL and agent.agent_index in target.visitors):
                     agent.target_index = None
 
-        for idx in range(0, self.num_agents):
+        for idx in range(self.num_agents):
             if not self.agents[idx].inaction:
                 self.agents[idx].last_target = self.agents[idx].target_index
 
@@ -663,7 +688,7 @@ class AgentHandler:
                 if SHOW_OWN_LOCATION:
                     update_message += f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
 
-                for idx in range(0, len(self.agents)):
+                for idx in range(len(self.agents)):
                     if idx == agent_index or self.agents[idx].inaction:
                         continue
                     teammate = self.agents[idx]
@@ -675,11 +700,11 @@ class AgentHandler:
                         teammate_target = "None (idle)"
                     else:
                         mate_target = self.environment.target_locations[teammate.last_target]
-                        teammate_target = f"{mate_target.target_type.value} {teammate.last_target}"
+                        teammate_target = self._target_name(teammate.last_target, mate_target, agent_index)
 
                     if random.random() < self.failed_inference_chance:
                         wrong = random.randrange(len(self.environment.target_locations))
-                        teammate_target = f"{self.environment.target_locations[wrong].target_type.value} {wrong}"
+                        teammate_target = self._target_name(wrong, self.environment.target_locations[wrong], agent_index)
                     update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
                                         
                     if self.comms_quality > 0.0:
@@ -699,7 +724,7 @@ class AgentHandler:
                             if target.visited:
                                # update_message += f"TASK {idx} COMPLETE\n"
                                pass
-                            else:
+                            else: # TODO: EXPERIMENTAL, update TOS prompting to account for unknown target types
                                 update_message += f"TASK {idx} ({target.target_type.value}): INCOMPLETE\n"
                                 if SHOW_TARGET_COORDS:
                                     distance = geo.point_distance(agent.location, target.get_location())
@@ -715,14 +740,14 @@ class AgentHandler:
 
                     # If Theory of Scene is not being used, use a more generic format
                     else:
-                        update_message += f"The following targets have yet to be visited:\n"
+                        update_message += "The following targets have yet to be visited:\n"
                         for idx, target in enumerate(self.environment.target_locations):
                             if target.visited:
                                 pass
                                 #update_message += f"Target {idx} has been cleared, choose another target.\n"
 
                             elif not (target.target_type == TargetType.SEQUENTIAL and agent_index in target.visitors):
-                                update_message += f"Target {idx} ({target.target_type.value}): INCOMPLETE\n"
+                                update_message += f"Target {idx} ({self._type_text(target, agent_index)}): INCOMPLETE\n"
                                 if SHOW_TARGET_COORDS:
                                     distance = geo.point_distance(agent.location, target.get_location())
                                     update_message += (f"    Location: X={target.north_m:.1f}m, Y={target.east_m:.1f}m, "
@@ -807,6 +832,14 @@ class AgentHandler:
         target_location = target.get_location()
         rivals.sort(key=lambda a: (geo.point_distance(a.location, target_location), a.agent_index))
         return agent not in rivals[:slots]
+
+    def _type_text(self, target, agent_index):
+        return target.target_type.value if type_is_known(target, agent_index) else "type unknown"
+
+    def _target_name(self, idx, target, agent_index):
+        if type_is_known(target, agent_index):
+            return f"{target.target_type.value} {idx}"
+        return f"Target {idx}"
 
 
 # Statistical helper functions

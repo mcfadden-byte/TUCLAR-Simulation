@@ -1,9 +1,11 @@
-import osmnx as ox
-from shapely.geometry import Point
 import math
 import random
-import utils_geometry as geo
 from enum import Enum
+
+import osmnx as ox
+from shapely.geometry import Point
+
+import utils_geometry as geo
 
 """
 Exclusive: only one drone needs to visit the location for it to be considered cleared.
@@ -128,7 +130,7 @@ class Environment:
     def check_visit(self, lat: float, lon: float, alt: float):
         for location in self.target_locations:
             lat1, lon1, alt1 = location.get_location()
-            if degrees_to_meters(lat1, lon1, alt1, lat, lon, alt) < VISIT_RADIUS_METERS:
+            if geo.degrees_to_meters(lat1, lon1, alt1, lat, lon, alt) < VISIT_RADIUS_METERS:
                 return True
         return False
 
