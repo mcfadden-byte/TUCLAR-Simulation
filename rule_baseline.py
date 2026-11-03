@@ -11,7 +11,14 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import utils_geometry as geo
-from agent import SHOW_OWN_LOCATION, SHOW_TARGET_COORDS, Agent, AgentHandler, type_is_known
+from agent import (
+    SHOW_OWN_LOCATION,
+    SHOW_TARGET_COORDS,
+    TARGET_TYPE_VISIBILITY,
+    Agent,
+    AgentHandler,
+    type_is_known,
+)
 from environment import Environment, TargetLocation, TargetType
 
 HOME = [0, 0, 0]
@@ -158,7 +165,7 @@ class RuleResult:
     invalid_actions: int                  # total across all trials
 
 
-def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance=0.0, noise_rng=None):
+def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance=0.0, noise_rng=None, type_visibility=TARGET_TYPE_VISIBILITY):
     teammates = []
     for other in agents:
         if other is me or other.inaction:
@@ -180,7 +187,7 @@ def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, sh
     views = []
     for j, t in enumerate(targets):
         known = type_is_known(t, me.agent_index, type_visibility)
-        claimants = tuple(a.agent_index for a in agents if a.last_target == j and not a.inaction)
+        claimants = tuple(sorted(i for i, lt in seen.items() if lt == j))
         loc = dist = None
         if show_coords:
             loc = t.get_location()
@@ -236,7 +243,7 @@ def _apply(agent, decision, targets, comms_quality, rng):
 
 
 def run_once(spec, num_agents, velocity, start, policy_factory,
-             comms_quality, comms_distance, show_coords, show_own_location, seed, failed_inference_chance=0.0):
+             comms_quality, comms_distance, show_coords, show_own_location, seed, failed_inference_chance=0.0, type_visibility=TARGET_TYPE_VISIBILITY):
     rng = random.Random(seed)
     targets = [TargetLocation(n, e, a, kind) for n, e, a, kind in spec]
     env = SimpleNamespace(target_locations=targets)
@@ -250,7 +257,7 @@ def run_once(spec, num_agents, velocity, start, policy_factory,
     for rounds in range(1, MAX_ROUNDS + 1):
         # Snapshot first: every drone decides from the same pre-round state
         observations = {a.agent_index: _observe(a, agents, targets, comms_quality, comms_distance,
-                                                show_coords, show_own_location, failed_inference_chance, noise_rng)
+                                                show_coords, show_own_location, failed_inference_chance, noise_rng, type_visibility)
                         for a in agents if not a.inaction}
         decisions = {i: policies[i].decide(obs) for i, obs in observations.items()}
 
@@ -274,13 +281,13 @@ def run_once(spec, num_agents, velocity, start, policy_factory,
 
 def evaluate(environment, num_agents, velocity, start=(0, 0, 1000), policy_factory=RulePolicy,
              trials=1, comms_quality=0.0, comms_distance=1000,
-             show_coords=SHOW_TARGET_COORDS, show_own_location=SHOW_OWN_LOCATION, seed=0, failed_inference_chance=0.0):
+             show_coords=SHOW_TARGET_COORDS, show_own_location=SHOW_OWN_LOCATION, seed=0, failed_inference_chance=0.0, type_visibility=TARGET_TYPE_VISIBILITY):
     spec = [(t.north_m, t.east_m, t.alt, t.target_type) for t in environment.target_locations]
     dists, rounds_list, invalid_total = [], [], 0
     for k in range(trials):
         ok, dist, rounds, invalid = run_once(spec, num_agents, velocity, start, policy_factory,
                                              comms_quality, comms_distance,
-                                             show_coords, show_own_location, seed + k, failed_inference_chance)
+                                             show_coords, show_own_location, seed + k, failed_inference_chance, type_visibility)
         invalid_total += invalid
         if ok:
             dists.append(dist)

@@ -219,3 +219,9 @@ __marimo__/
 
 # Logs
 *.csv
+
+# Git merge files
+*BACKUP*
+*BASE*
+*LOCAL*
+*REMOTE*

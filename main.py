@@ -55,7 +55,7 @@ class Simulation:
         match self.scenario:
             case 0: num_agents = 1
             case 1: num_agents = 5
-        self.handler = AgentHandler(num_agents, self.scenario, self.environment, 0.5, 1000)
+        self.handler = AgentHandler(num_agents, self.scenario, self.environment, 0.8, 1000)
         return True
 
 
@@ -187,7 +187,7 @@ def agent_worker(sim, response_queue):
 
 
 if __name__ == "__main__":
-    for i in range(2):
+    for i in range(20):
         # Metrics we'll use to measure the quality of success
         num_rounds: int
         num_visits: int
