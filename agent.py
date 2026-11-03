@@ -331,7 +331,7 @@ class AgentHandler:
         self.seconds_per_round = LLM_TIME_LIMIT_SECONDS
         self.sim_start = None
         self.sim_end = None
-        self.failed_inference_chance = 0.05
+        self.failed_inference_chance = 0.15
 
         self.system_prompt = SYSTEM_PROMPTS[PROMPT_STYLE]
 
@@ -347,7 +347,7 @@ class AgentHandler:
             1: """
                 MISSION REQUIREMENTS:
                     1. There is a series of locations that you will be given.
-                    2. You will have a series of teammates. All your teammates reason exactly the same as you.
+                    2. You will have a series of teammates. All your teammates reason exactly the same as you. The prompt will tell you what they are doing, but each prompt has a chance of giving the wrong value. Be cautious of this input error.
                     3. The mission is a success once all target locations are cleared, and you have used the RECALL action to go back to start.
                     4. There are three types of target location: Sequential, which must be visited by three different agents at any point (you do not need to all visit at the same time). Joint, which must be visited by two different agents at the *same time*. And Exclusive, which must be visited by any agent.
                     5. Complete the mission as quick as possible.
@@ -437,7 +437,7 @@ class AgentHandler:
           "sim_time_seconds", "avg_ttft", "std_ttft", "avg_reasoning_s", "std_reasoning_s",
           "avg_answer_s", "std_answer_s", "avg_completion_tokens", "std_completion_tokens", "optimal_distance",
           "optimal_rounds", "rule_success_rate", "rule_avg_distance", "rule_avg_rounds", "rule_invalid_actions",
-          "avg_distance", "avg_rounds", "prompt style", "planning style", "num_agents",
+          "prompt_style", "planning_style", "num_agents",
           "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
           "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance", "type_visibility"]
         
@@ -460,8 +460,6 @@ class AgentHandler:
             self._std_stat("completion_tokens"),
             "" if optimal is None else f"{optimal.distance:.2f}",
             "" if optimal is None else optimal.rounds,
-            "" if optimal is None else f"{optimal.avg_distance:.2f}",
-            "" if optimal is None else f"{optimal.avg_rounds:.2f}",
             "" if rule is None else f"{rule.success_rate:.2f}",
             "" if rule is None or rule.avg_distance is None else f"{rule.avg_distance:.2f}",
             "" if rule is None or rule.avg_rounds is None else f"{rule.avg_rounds:.2f}",
@@ -631,6 +629,11 @@ class AgentHandler:
                 print(f"Agent {agent_index} gave malformed FLY action: {action!r}")
         else:
             print(f"Agent {agent_index} gave unrecognized action: {action!r}")
+
+        if random.random() < self.comms_quality:
+            agent.displayed_message = data.get("message", "")
+        else:
+            agent.displayed_message = "Communication Failure."
 
     # Set velocity to go towards the target.
     # TODO: change velocity based on how much time the agent spent thinking?

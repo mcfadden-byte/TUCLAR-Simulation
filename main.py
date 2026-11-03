@@ -198,7 +198,7 @@ if __name__ == "__main__":
         sim.init_handler()
         sim.show_map()
         optimal = sim.find_optimal()
-        rule = rule_baseline.evaluate(sim.environment, sim.handler.num_agents, sim.handler.drone_velocity, comms_quality=sim.handler.comms_quality, comms_distance=sim.handler.comms_distance)
+        rule = rule_baseline.evaluate(sim.environment, sim.handler.num_agents, sim.handler.drone_velocity, comms_quality=sim.handler.comms_quality, comms_distance=sim.handler.comms_distance, failed_inference_chance=sim.handler.failed_inference_chance, trials=50)
 
         response_queue = queue.Queue()
         worker = threading.Thread(target=agent_worker, args=(sim, response_queue), daemon=True)
