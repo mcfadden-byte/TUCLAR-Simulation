@@ -1,8 +1,11 @@
 import warnings
 
 warnings.filterwarnings('ignore')
+import json
 import os
 import queue
+import shutil
+import sys
 import threading
 import time
 
@@ -10,16 +13,13 @@ import contextily as ctx
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
 
+import agent as agent_mod
 import find_optimal
 import rule_baseline
 import utils_geometry as geo
 from agent import AgentHandler
 from environment import Environment
 
-import json
-import shutil
-import sys
-import threading
 RECORD = False
 RECORD_DIR = os.environ.get("LOG_DIR")
 
@@ -170,7 +170,7 @@ class Simulation:
 
     # Draw each obstacle's 2D footprint once; labeled with its altitude range
     def draw_obstacles(self):
-        for obs in self.environment.obstacles:
+        for obs in self.environment.vision_obstacles:
             ring = []
             for north, east in obs.footprint:
                 lat, lon, _ = geo.local_to_latlon(north, east, 0, self.center_lat, self.center_lon)
