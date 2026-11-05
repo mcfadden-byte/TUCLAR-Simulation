@@ -8,6 +8,7 @@ import time
 
 import contextily as ctx
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
 
 import find_optimal
 import rule_baseline
@@ -121,6 +122,9 @@ class Simulation:
 
         # Display buildings loaded from OSM
         self.environment.buildings_gdf.plot(ax=self.ax, facecolor="orange", edgecolor="black", alpha=0.5, zorder=3)
+        
+        # Render obstacles
+        self.draw_obstacles()
 
         self.update_object_positions()
 
@@ -155,6 +159,20 @@ class Simulation:
 
         plt.pause(0.01)
 
+
+    # Draw each obstacle's 2D footprint once; labeled with its altitude range
+    def draw_obstacles(self):
+        for obs in self.environment.obstacles:
+            ring = []
+            for north, east in obs.footprint:
+                lat, lon, _ = geo.local_to_latlon(north, east, 0, self.center_lat, self.center_lon)
+                ring.append((lon, lat))
+            self.ax.add_patch(MplPolygon(ring, closed=True, facecolor="purple", edgecolor="white",
+                                         alpha=0.45, zorder=4))
+            c = obs.polygon.centroid  # x = north, y = east
+            lat, lon, _ = geo.local_to_latlon(c.x, c.y, 0, self.center_lat, self.center_lon)
+            self.ax.text(lon, lat, f"{obs.base_alt:.0f}-{obs.top_alt:.0f} m", fontsize=7,
+                         color="white", ha="center", va="center", zorder=7)
 
     def _on_close(self, event):
         self.window_closed = True

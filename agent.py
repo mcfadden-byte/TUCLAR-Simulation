@@ -366,6 +366,9 @@ class AgentHandler:
             who = "any drone has" if TARGET_TYPE_VISIBILITY == "any_visit" else "you have"
             self.system_prompt += (f"\nNOTE: A target's type is shown as \"type unknown\" until {who} visited it, so you may not know how many drones it needs.\n")
 
+        if scenario == 1 and self.environment.vision_obstacles:
+            self.system_prompt += ("\nNOTE: Obstacles may block line of sight between drones. If line of sight to a teammate is blocked, you cannot see which target they are heading to. Radio messages are unaffected.\n")
+
         self.num_agents = num_agents
         self.agents = []
         for idx in range(num_agents):
@@ -691,25 +694,32 @@ class AgentHandler:
                 if SHOW_OWN_LOCATION:
                     update_message += f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
 
+                # Teammates
                 for idx in range(len(self.agents)):
                     if idx == agent_index or self.agents[idx].inaction:
                         continue
                     teammate = self.agents[idx]
                     teammate_target: str
-                    teammate_location = self.agents[idx].location
-                    if teammate.last_target == -1:
-                        teammate_target = "Unknown"
-                    elif teammate.last_target is None:
-                        teammate_target = "None (idle)"
-                    else:
-                        mate_target = self.environment.target_locations[teammate.last_target]
-                        teammate_target = self._target_name(teammate.last_target, mate_target, agent_index)
 
-                    if random.random() < self.failed_inference_chance:
-                        wrong = random.randrange(len(self.environment.target_locations))
-                        teammate_target = self._target_name(wrong, self.environment.target_locations[wrong], agent_index)
+                    # Teammate decision last round
+                    teammate_location = self.agents[idx].location
+                    if not self.environment.has_line_of_sight(agent.location, teammate_location):
+                        teammate_target = "Unknown"
+                    else:
+                        if teammate.last_target == -1:
+                            teammate_target = "Unknown"
+                        elif teammate.last_target is None:
+                            teammate_target = "None (idle)"
+                        else:
+                            mate_target = self.environment.target_locations[teammate.last_target]
+                            teammate_target = self._target_name(teammate.last_target, mate_target, agent_index)
+
+                        if random.random() < self.failed_inference_chance:
+                            wrong = random.randrange(len(self.environment.target_locations))
+                            teammate_target = self._target_name(wrong, self.environment.target_locations[wrong], agent_index)
                     update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
-                                        
+                    
+                    # Teammate message
                     if self.comms_quality > 0.0:
                         if self.comms_distance == -1 or geo.geometric_mean_3d(teammate_location[0], teammate_location[1], teammate_location[2], agent.location[0], agent.location[1], agent.location[2]) <= self.comms_distance:
                             update_message += f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n"

@@ -3,7 +3,7 @@ import random
 from enum import Enum
 
 import osmnx as ox
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point, Polygon
 
 import utils_geometry as geo
 
@@ -79,6 +79,54 @@ class TargetLocation:
             return self.required_drones - len(self.visitors)  # distinct drones still needed
         return self.required_drones
 
+
+# Class VisionObstacle
+# A 3D shape in the environment that blocks line-of-sight
+# Currently, line-of-sight is only used 
+class VisionObstacle:
+
+    # If this object is between the two points, return false
+    def blocks(self, p1, p2) -> bool:
+        raise NotImplementedError
+
+# Class PrismObstacle
+# A VisionObstacle that takes the shape of a prism
+class PrismObstacle(VisionObstacle):
+    def __init__(self, footprint, base_alt: float=0, top_alt: float=100000):
+        self.footprint = [(float(n), float(e)) for n, e in footprint] # Points described in North and East
+        self.base_alt = base_alt
+        self.top_alt = top_alt
+        self.polygon = Polygon(self.footprint)  # Forms a polygon from the points in the footprint
+        if not self.polygon.is_valid or self.polygon.area <= 0 or top_alt <= base_alt:
+            raise ValueError("Invalid prism")
+
+    # Check if a point is inside the prism's 2D area
+    def contains_xy(self, north, east) -> bool:
+        return self.polygon.contains(Point(north, east))
+
+    # Check if the prism is blocking view between the two points
+    def blocks(self, p1, p2) -> bool:
+        # Clip the segment to the prism's altitude slab: p(t) = p1 + t*(p2 - p1)
+        t0, t1 = 0.0, 1.0
+        dz = p2[2] - p1[2]
+        if abs(dz) < 1e-9:
+            if not (self.base_alt <= p1[2] <= self.top_alt):
+                return False
+        else:
+            ta = (self.base_alt - p1[2]) / dz
+            tb = (self.top_alt - p1[2]) / dz
+            t0 = max(t0, min(ta, tb))
+            t1 = min(t1, max(ta, tb))
+            if t0 > t1:
+                return False
+
+        # The clipped piece is inside the slab; check whether its footprint hits the polygon
+        a = (p1[0] + t0 * (p2[0] - p1[0]), p1[1] + t0 * (p2[1] - p1[1]))
+        b = (p1[0] + t1 * (p2[0] - p1[0]), p1[1] + t1 * (p2[1] - p1[1]))
+        seg = Point(a) if a == b else LineString([a, b])
+        return self.polygon.intersects(seg)
+
+
 class Environment:
 
     def __init__(self, scenario: int, center_lat: float, center_lon: float, area_size_m: float = 1000):
@@ -91,6 +139,7 @@ class Environment:
         self._load_osm_features()
 
         self.target_locations = []
+        self.vision_obstacles = []
 
         match scenario:
             case 0: # Scenario 0: One target, random location
@@ -101,6 +150,7 @@ class Environment:
                     TargetType.JOINT: random.randint(1, 4),
                     TargetType.SEQUENTIAL: random.randint(2, 4),
                 })
+                self._spawn_vision_obstacles(1)
 
     # Load map data. Just loads buildings for now.
     def _load_osm_features(self):
@@ -114,6 +164,32 @@ class Environment:
     def is_blocked(self, lat, lon):
         point = Point(lon, lat)
         return self.buildings_gdf.intersects(point).any()
+
+    def _spawn_vision_obstacles(self, count: int):
+        """Random regular pentagons. Rejects any covering the origin or a target."""
+        half = self.area_size_m / 2
+        keep_clear = [(0.0, 0.0)] + [(t.north_m, t.east_m) for t in self.target_locations]
+        attempts = 0
+        while len(self.vision_obstacles) < count and attempts < 100 * max(count, 1):
+            attempts += 1
+            cn, ce = random.uniform(-half, half), random.uniform(-half, half)
+            radius = random.uniform(250, 350)
+            rotation = random.uniform(0, 2 * math.pi / 5)
+            footprint = [
+                (cn + radius * math.cos(rotation + 2 * math.pi * i / 5),
+                 ce + radius * math.sin(rotation + 2 * math.pi * i / 5))
+                for i in range(5)
+            ]
+            try:
+                obs = PrismObstacle(footprint, 0.0)
+            except ValueError:
+                continue
+            if any(obs.contains_xy(n_, e_) for n_, e_ in keep_clear):
+                continue
+            self.vision_obstacles.append(obs)
+
+    def has_line_of_sight(self, p1, p2) -> bool:
+        return not any(o.blocks(p1, p2) for o in self.vision_obstacles)
 
     def check_visits(self, agents):
         for target in self.target_locations:
