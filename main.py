@@ -200,14 +200,17 @@ class Simulation:
 class Tee:
     """Duplicates a stream (stdout/stderr) into a file. Thread-safe."""
 
-    def __init__(self, stream, file, lock):
-        self.stream, self.file, self.lock = stream, file, lock
+    def __init__(self, stream, file, lock, events=None):
+        self.stream, self.file, self.lock, self.events = stream, file, lock, events
 
     def write(self, s):
         with self.lock:
             self.stream.write(s)
             self.file.write(s)
             self.file.flush()
+            if self.events is not None and s:
+                self.events.write(json.dumps({"t": time.time(), "s": s}) + "\n")
+                self.events.flush()
         return len(s)
 
     def flush(self):
@@ -296,6 +299,7 @@ class Recorder:
                    for t in env.target_locations]
         self.rounds_file.write(json.dumps({
             "round": n,
+            "t_epoch": time.time(),
             "wall_s": time.perf_counter() - self.t0,
             "agents": agents,
             "targets": targets,
@@ -335,7 +339,7 @@ def agent_worker(sim, response_queue, render_done=None):
 
 if __name__ == "__main__":
     session = time.strftime("%Y%m%d_%H%M%S")
-    for i in range(20):
+    for i in range(2):
         recorder = out_file = None
         real_out, real_err = sys.stdout, sys.stderr
         if RECORD:
@@ -345,6 +349,11 @@ if __name__ == "__main__":
             lock = threading.Lock()
             sys.stdout = Tee(real_out, out_file, lock)
             sys.stderr = Tee(real_err, out_file, lock)
+            out_file = open(os.path.join(run_dir, "output.txt"), "w")
+            events_file = open(os.path.join(run_dir, "output_events.jsonl"), "w")
+            lock = threading.Lock()
+            sys.stdout = Tee(real_out, out_file, lock, events_file)
+            sys.stderr = Tee(real_err, out_file, lock, events_file)
 
         try:
             sim = Simulation(scenario=1, center_lat=44.6883889, center_lon=-111.1176389, area_size_m=2500)
@@ -389,6 +398,7 @@ if __name__ == "__main__":
             if RECORD:
                 sys.stdout, sys.stderr = real_out, real_err
                 out_file.close()
+                events_file.close()
 
         if sim.window_closed:
             break
