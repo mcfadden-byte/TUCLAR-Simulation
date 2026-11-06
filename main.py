@@ -260,7 +260,7 @@ class Recorder:
             "obstacles": [{"footprint_north_east": getattr(o, "footprint", None),
                            "base_alt": getattr(o, "base_alt", None),
                            "top_alt": getattr(o, "top_alt", None)}
-                          for o in env.obstacles],
+                          for o in env.vision_obstacles],
             "config": {k: getattr(agent_mod, k, None) for k in
                        ("PROMPT_STYLE", "PLANNER_MODE", "TARGET_TYPE_VISIBILITY", "LLM_MODEL",
                         "HISTORY_TURNS", "LLM_TIME_LIMIT_SECONDS", "SHOW_OWN_LOCATION",
