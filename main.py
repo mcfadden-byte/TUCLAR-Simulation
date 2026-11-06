@@ -20,8 +20,8 @@ import utils_geometry as geo
 from agent import AgentHandler
 from environment import Environment
 
-RECORD = False
-RECORD_DIR = os.environ.get("LOG_DIR")
+RECORD = True
+RECORD_DIR = os.environ.get("LOG_DIR", ".")
 
 HEADLESS = not os.environ.get("DISPLAY")
 
