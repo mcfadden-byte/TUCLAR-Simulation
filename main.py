@@ -12,18 +12,25 @@ import time
 import contextily as ctx
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.lines import Line2D
 
 import agent as agent_mod
 import find_optimal
 import rule_baseline
 import utils_geometry as geo
-from agent import AgentHandler
-from environment import Environment
+from agent import MAX_ROUNDS, AgentHandler
+from environment import Environment, TargetType
 
 RECORD = True
 RECORD_DIR = os.environ.get("LOG_DIR", ".")
 
 HEADLESS = not os.environ.get("DISPLAY")
+
+TARGET_COLORS = {
+    TargetType.EXCLUSIVE: "red",
+    TargetType.JOINT: "green",
+    TargetType.SEQUENTIAL: "purple",
+}
 
 """
 Simulation: The class that initiates the AgentHandler and the Environment. It is responsible for checking when
@@ -95,7 +102,7 @@ class Simulation:
 
     # If all agents decided to go home and do nothing before the mission was complete, the mission is a failure.
     def check_failure(self):
-        if self.handler.num_rounds > 500:
+        if self.handler.num_rounds >= MAX_ROUNDS:
             print("TIMEOUT: Simulation has been going on too long. Cutting it off and moving on.")
             return True
         match self.scenario:
@@ -139,6 +146,12 @@ class Simulation:
         # When the window closes, run _on_close
         self.fig.canvas.mpl_connect('close_event', self._on_close)
 
+        handles = [Line2D([], [], marker="o", linestyle="", markerfacecolor=c, markeredgecolor="black",
+                          markersize=9, label=t.value) for t, c in TARGET_COLORS.items()]
+        handles.append(Line2D([], [], marker="o", linestyle="", markerfacecolor="c", markeredgecolor="black",
+                              markersize=9, label="Drone"))
+        self.ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.8).set_zorder(10)
+
         plt.ion()
         plt.draw()
         plt.pause(0.1)
@@ -160,7 +173,9 @@ class Simulation:
 
 
         for target in self.environment.target_locations:
-            color = "gray" if target.visited else "r"
+            color = TARGET_COLORS[target.target_type]
+            if target.visited:
+                color = "gray"
             lat, lon, _ = geo.local_to_latlon(target.north_m, target.east_m, target.alt, self.center_lat, self.center_lon)
             target.scatter_pointer = self.ax.scatter(lon, lat, color=color, zorder=5, s=100)
 

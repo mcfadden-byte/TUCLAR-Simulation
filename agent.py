@@ -32,6 +32,7 @@ AgentHandler:   A class that helps the simulation "handle" agents. Parses the ag
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+# LLM Settings
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
 LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
 LLM_MODEL = os.environ.get("MODEL", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16")
@@ -40,9 +41,11 @@ LLM_ENABLE_REASONING = True
 LLM_REMEMBER_REASONING = True
 MAX_TOKENS = 32000
 TEMPERATURE = 0.0
-
-# Past exchanges each agent remembers (0 = stateless).
 HISTORY_TURNS = 3
+
+# Simulation settings
+MAX_ROUNDS = 500
+UNKNOWN_SLOT_GUESS = 1
 
 # CSV logs go here. Set LOG_DIR to write each experiment to its own folder.
 LOG_DIR = os.environ.get("LOG_DIR", ".")
@@ -327,11 +330,12 @@ class AgentHandler:
         self.num_rounds = 0
         self.comms_quality = comms_quality #Set to 1 for perfect comms
         self.comms_distance = comms_distance #Set to -1 for infinite range
-        self.drone_velocity = 300
+        self.drone_velocity = 100
         self.seconds_per_round = LLM_TIME_LIMIT_SECONDS
         self.sim_start = None
         self.sim_end = None
         self.failed_inference_chance = 0.15
+        self.teammate_views = {}
 
         self.system_prompt = SYSTEM_PROMPTS[PROMPT_STYLE]
 
@@ -535,6 +539,7 @@ class AgentHandler:
             self.sim_start = time.perf_counter()
 
         # Decide who should or should not reason this round
+        self.teammate_views = {i: self._observe_teammate_targets(i) for i in range(self.num_agents) if not self.agents[i].inaction}
         to_prompt = [idx for idx in range(self.num_agents) if self.should_prompt(self.agents[idx])]
         print(f"Round {self.num_rounds}: prompting agents {to_prompt}")
 
@@ -694,31 +699,26 @@ class AgentHandler:
                 if SHOW_OWN_LOCATION:
                     update_message += f"YOUR LOCATION: X={agent.location[0]:.1f}m, Y={agent.location[1]:.1f}m\n"
 
+                # Which teammates can see each other
+                views = self.teammate_views.get(agent_index) or self._observe_teammate_targets(agent_index)
+
                 # Teammates
                 for idx in range(len(self.agents)):
                     if idx == agent_index or self.agents[idx].inaction:
                         continue
+                   
+                    # Teammate direction
                     teammate = self.agents[idx]
-                    teammate_target: str
-
-                    # Teammate decision last round
-                    teammate_location = self.agents[idx].location
-                    if not self.environment.has_line_of_sight(agent.location, teammate_location):
+                    teammate_location = teammate.location
+                    seen = views[idx]
+                    if seen == "blocked" or seen == -1:
                         teammate_target = "Unknown"
+                    elif seen is None:
+                        teammate_target = "None (idle)"
                     else:
-                        if teammate.last_target == -1:
-                            teammate_target = "Unknown"
-                        elif teammate.last_target is None:
-                            teammate_target = "None (idle)"
-                        else:
-                            mate_target = self.environment.target_locations[teammate.last_target]
-                            teammate_target = self._target_name(teammate.last_target, mate_target, agent_index)
-
-                        if random.random() < self.failed_inference_chance:
-                            wrong = random.randrange(len(self.environment.target_locations))
-                            teammate_target = self._target_name(wrong, self.environment.target_locations[wrong], agent_index)
+                        teammate_target = self._target_name(seen, self.environment.target_locations[seen], agent_index)
                     update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
-                    
+
                     # Teammate message
                     if self.comms_quality > 0.0:
                         if self.comms_distance == -1 or geo.geometric_mean_3d(teammate_location[0], teammate_location[1], teammate_location[2], agent.location[0], agent.location[1], agent.location[2]) <= self.comms_distance:
@@ -825,26 +825,25 @@ class AgentHandler:
     # Check if there is no need for the given agent to go to the given target
     # Mostly important for if there are too many drones going to one target.
     def _is_surplus(self, agent, target) -> bool:
-        sequential = target.target_type == TargetType.SEQUENTIAL
-
-        # Sequential counts distinct drones, so a drone that already counted adds nothing by returning
-        if sequential and agent.agent_index in target.visitors:
+        me = agent.agent_index
+        # A drone knows its own visit history
+        if target.target_type == TargetType.SEQUENTIAL and me in target.visitors:
             return True
 
-        rivals = [
-            a for a in self.agents
-            if a.target_index == agent.target_index
-            and not a.inaction
-            and not (sequential and a.agent_index in target.visitors)
-        ]
-        slots = target.slots_remaining()
+        # Slots come from the type only if the drone knows it; otherwise use the guess
+        slots = target.required_drones if type_is_known(target, me) else UNKNOWN_SLOT_GUESS
+
+        # Rivals are teammates this drone believes are heading to the same target
+        views = self.teammate_views.get(me, {})
+        rivals = [me] + [i for i, t in views.items()
+                         if t == agent.target_index and not self.agents[i].inaction]
         if len(rivals) <= slots:
             return False
 
-        # Keep the closest drones on the task; only the surplus (farthest) ones get re-prompted
-        target_location = target.get_location()
-        rivals.sort(key=lambda a: (geo.point_distance(a.location, target_location), a.agent_index))
-        return agent not in rivals[:slots]
+        # Teammate locations aren't visible to the drone, so the lowest indices keep the target
+        rivals.sort()
+        return me not in rivals[:slots]
+
 
     def _type_text(self, target, agent_index):
         return target.target_type.value if type_is_known(target, agent_index) else "type unknown"
@@ -853,6 +852,24 @@ class AgentHandler:
         if type_is_known(target, agent_index):
             return f"{target.target_type.value} {idx}"
         return f"Target {idx}"
+
+    def _observe_teammate_targets(self, agent_index):
+        """What this drone can infer about each active teammate's target:
+        a target index, None (idle), -1 (unknown), or "blocked" (no line of sight).
+        Noise is applied here, once per round."""
+        me = self.agents[agent_index]
+        seen = {}
+        for idx, mate in enumerate(self.agents):
+            if idx == agent_index or mate.inaction:
+                continue
+            if not self.environment.has_line_of_sight(me.location, mate.location):
+                seen[idx] = "blocked"
+                continue
+            last = mate.last_target
+            if random.random() < self.failed_inference_chance:
+                last = random.randrange(len(self.environment.target_locations))
+            seen[idx] = last
+        return seen
 
 
 # Statistical helper functions

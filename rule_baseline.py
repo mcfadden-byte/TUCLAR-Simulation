@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import utils_geometry as geo
 from agent import (
+    MAX_ROUNDS,
     SHOW_OWN_LOCATION,
     SHOW_TARGET_COORDS,
     TARGET_TYPE_VISIBILITY,
@@ -23,7 +24,6 @@ from environment import Environment, TargetLocation, TargetType
 
 HOME = [0, 0, 0]
 HOME_TOLERANCE = 1
-MAX_ROUNDS = 400
 
 
 # ---------------------------------------------------------------------------
@@ -165,14 +165,16 @@ class RuleResult:
     invalid_actions: int                  # total across all trials
 
 
-def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance=0.0, noise_rng=None, type_visibility=TARGET_TYPE_VISIBILITY):
+def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance=0.0, noise_rng=None, type_visibility=TARGET_TYPE_VISIBILITY, vision_obstacles=()):
     teammates = []
     for other in agents:
         if other is me or other.inaction:
             continue
 
         last = other.last_target
-        if noise_rng is not None and noise_rng.random() < failed_inference_chance:
+        if any(o.blocks(me.location, other.location) for o in vision_obstacles):
+            last = -1   # no line of sight: target unknown
+        elif noise_rng is not None and noise_rng.random() < failed_inference_chance:
             last = noise_rng.randrange(len(targets))
 
         message = None
@@ -242,8 +244,7 @@ def _apply(agent, decision, targets, comms_quality, rng):
     return valid
 
 
-def run_once(spec, num_agents, velocity, start, policy_factory,
-             comms_quality, comms_distance, show_coords, show_own_location, seed, failed_inference_chance=0.0, type_visibility=TARGET_TYPE_VISIBILITY):
+def run_once(spec, num_agents, velocity, start, policy_factory, comms_quality, comms_distance, show_coords, show_own_location, seed, failed_inference_chance=0.0, type_visibility=TARGET_TYPE_VISIBILITY, vision_obstacles=()):
     rng = random.Random(seed)
     targets = [TargetLocation(n, e, a, kind) for n, e, a, kind in spec]
     env = SimpleNamespace(target_locations=targets)
@@ -256,8 +257,7 @@ def run_once(spec, num_agents, velocity, start, policy_factory,
 
     for rounds in range(1, MAX_ROUNDS + 1):
         # Snapshot first: every drone decides from the same pre-round state
-        observations = {a.agent_index: _observe(a, agents, targets, comms_quality, comms_distance,
-                                                show_coords, show_own_location, failed_inference_chance, noise_rng, type_visibility)
+        observations = {a.agent_index: _observe(a, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance, noise_rng, type_visibility, vision_obstacles)
                         for a in agents if not a.inaction}
         decisions = {i: policies[i].decide(obs) for i, obs in observations.items()}
 
@@ -285,9 +285,19 @@ def evaluate(environment, num_agents, velocity, start=(0, 0, 1000), policy_facto
     spec = [(t.north_m, t.east_m, t.alt, t.target_type) for t in environment.target_locations]
     dists, rounds_list, invalid_total = [], [], 0
     for k in range(trials):
-        ok, dist, rounds, invalid = run_once(spec, num_agents, velocity, start, policy_factory,
-                                             comms_quality, comms_distance,
-                                             show_coords, show_own_location, seed + k, failed_inference_chance, type_visibility)
+        ok, dist, rounds, invalid = run_once(spec,
+                                            num_agents,
+                                            velocity,
+                                            start,
+                                            policy_factory,
+                                            comms_quality,
+                                            comms_distance,
+                                            show_coords,
+                                            show_own_location,
+                                            seed + k,
+                                            failed_inference_chance,
+                                            type_visibility,
+                                            environment.vision_obstacles)
         invalid_total += invalid
         if ok:
             dists.append(dist)
