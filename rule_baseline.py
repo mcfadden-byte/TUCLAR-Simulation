@@ -7,6 +7,7 @@ acts, so a drone never sees a teammate's current-round choice. Movement and visi
 the simulator's own methods, as in optimal.py.
 """
 import random
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -163,6 +164,7 @@ class RuleResult:
     avg_distance: float | None         # over successful trials
     avg_rounds: float | None           # over successful trials
     invalid_actions: int                  # total across all trials
+    avg_ns_per_drone_round: float | None = None
 
 
 def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance=0.0, noise_rng=None, type_visibility=TARGET_TYPE_VISIBILITY, vision_obstacles=()):
@@ -254,6 +256,7 @@ def run_once(spec, num_agents, velocity, start, policy_factory, comms_quality, c
                 for i in range(num_agents)]
     noise_rng = random.Random(rng.getrandbits(32))
     invalid = 0
+    t0 = time.perf_counter_ns()
 
     for rounds in range(1, MAX_ROUNDS + 1):
         # Snapshot first: every drone decides from the same pre-round state
@@ -275,8 +278,8 @@ def run_once(spec, num_agents, velocity, start, policy_factory, comms_quality, c
 
         if all(t.cleared for t in targets) and all(
                 geo.point_distance(a.location, HOME) < HOME_TOLERANCE for a in agents):
-            return True, sum(a.distance_traveled for a in agents), rounds, invalid
-    return False, None, MAX_ROUNDS, invalid
+            return True, sum(a.distance_traveled for a in agents), rounds, invalid, time.perf_counter_ns() - t0
+    return False, None, MAX_ROUNDS, invalid, time.perf_counter_ns() - t0
 
 
 def evaluate(environment, num_agents, velocity, start=(0, 0, 1000), policy_factory=RulePolicy,
@@ -284,8 +287,9 @@ def evaluate(environment, num_agents, velocity, start=(0, 0, 1000), policy_facto
              show_coords=SHOW_TARGET_COORDS, show_own_location=SHOW_OWN_LOCATION, seed=0, failed_inference_chance=0.0, type_visibility=TARGET_TYPE_VISIBILITY):
     spec = [(t.north_m, t.east_m, t.alt, t.target_type) for t in environment.target_locations]
     dists, rounds_list, invalid_total = [], [], 0
+    total_ns = total_drone_rounds = 0
     for k in range(trials):
-        ok, dist, rounds, invalid = run_once(spec,
+        ok, dist, rounds, invalid, elapsed_ns = run_once(spec,
                                             num_agents,
                                             velocity,
                                             start,
@@ -298,12 +302,16 @@ def evaluate(environment, num_agents, velocity, start=(0, 0, 1000), policy_facto
                                             failed_inference_chance,
                                             type_visibility,
                                             environment.vision_obstacles)
+        total_ns = elapsed_ns
+        total_drone_rounds += num_agents * rounds
         invalid_total += invalid
         if ok:
             dists.append(dist)
             rounds_list.append(rounds)
     n = len(dists)
-    return RuleResult(trials, n / trials,
-                      sum(dists) / n if n else None,
-                      sum(rounds_list) / n if n else None,
-                      invalid_total)
+    return RuleResult(  trials,
+                        n / trials,
+                        sum(dists) / n if n else None,
+                        sum(rounds_list) / n if n else None,
+                        invalid_total,
+                        total_ns / total_drone_rounds if total_drone_rounds else None)

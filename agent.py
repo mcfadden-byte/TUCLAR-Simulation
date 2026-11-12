@@ -446,7 +446,8 @@ class AgentHandler:
           "optimal_rounds", "rule_success_rate", "rule_avg_distance", "rule_avg_rounds", "rule_invalid_actions",
           "prompt_style", "planning_style", "num_agents",
           "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
-          "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance", "type_visibility"]
+          "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance", "type_visibility",
+          "rule_ns_per_drone_round"]
         
 
         target_types = self.environment.get_target_amounts()
@@ -484,7 +485,8 @@ class AgentHandler:
             self._rate_stat("timed_out"),
             self._rate_stat("invalid_json"),
             self.failed_inference_chance,
-            TARGET_TYPE_VISIBILITY
+            TARGET_TYPE_VISIBILITY,
+            "" if rule is None or rule.avg_ns_per_drone_round is None else f"{rule.avg_ns_per_drone_round:.0f}",
         ]
 
         os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)

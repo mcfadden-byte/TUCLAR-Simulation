@@ -21,7 +21,7 @@ import utils_geometry as geo
 from agent import MAX_ROUNDS, AgentHandler
 from environment import Environment, TargetType
 
-RECORD = True
+RECORD = False
 RECORD_DIR = os.environ.get("LOG_DIR", ".")
 
 HEADLESS = not os.environ.get("DISPLAY")
@@ -354,7 +354,7 @@ def agent_worker(sim, response_queue, render_done=None):
 
 if __name__ == "__main__":
     session = time.strftime("%Y%m%d_%H%M%S")
-    for i in range(2):
+    for i in range(10):
         recorder = out_file = None
         real_out, real_err = sys.stdout, sys.stderr
         if RECORD:
