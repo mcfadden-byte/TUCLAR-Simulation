@@ -1,0 +1,12 @@
+node_asis_c0 node 0 0 seeds20.txt 1
+node_asis_c0.2 node 0 0.2 seeds20.txt 0
+node_asis_c0.4 node 0 0.4 seeds20.txt 0
+node_asis_c0.6 node 0 0.6 seeds20.txt 0
+node_asis_c0.8 node 0 0.8 seeds20.txt 0
+node_asis_c1 node 0 1 seeds20.txt 0
+node_noobs_c0 node 1 0 seeds20.txt 1
+node_noobs_c0.2 node 1 0.2 seeds20.txt 0
+node_noobs_c0.4 node 1 0.4 seeds20.txt 0
+node_noobs_c0.6 node 1 0.6 seeds20.txt 0
+node_noobs_c0.8 node 1 0.8 seeds20.txt 0
+node_noobs_c1 node 1 1 seeds20.txt 0
